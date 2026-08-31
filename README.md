@@ -73,10 +73,14 @@ On the channel this was built against the difference is real: over 365 days the 
   over exactly the hours the card draws.
 - **Channel dashboard** — the summary card and top content.
 - **Content tab** — the video list's lifetime view counts.
+- **Traffic sources** — the tables that break views down by where viewers came from, along with
+  the share-of-views column beside them, which is recomputed from the converted figures.
 
 Not covered: the **latest video performance** card, whose figures arrive in a shape the
-substitution cannot reach. A screen carrying that card is left with Studio's own wording, so its
-raw count is never captioned as an engaged one.
+substitution cannot reach. More generally, a screen is only relabelled once every figure on it
+that Studio draws as a number has really been converted, so a raw count is never captioned as an
+engaged one. Sparklines split by two dimensions at once are the one exception: they cannot be
+converted and carry no caption, so they do not hold the wording back.
 
 `relabel.js` corrects the wording on the analytics screens, the dashboard and the video list —
 and only once the interceptor confirms the numbers on that surface really changed.
@@ -113,6 +117,24 @@ labels both live in the same payload: those are renamed together, which is why t
 "Engaged views" on its own. Everywhere else the wording is corrected in the page by
 `relabel.js`, and only once the interceptor confirms every figure on that screen really was
 converted.
+
+### Charts that run to this moment
+
+A video's "since published" chart plots a running total rather than each day on its own, and its
+last point is the figure as it stands now. Those are rebuilt as running totals ending on the
+figure the card reports.
+
+That figure cannot come from the daily store alone: it trails the live one by hours, which on a
+day-old video is most of its views. So the settled days are taken from the daily figures and
+today is added from the hourly ones. A query with no dimension at all is refused over a
+clock-time range, and an hourly one is refused unless its window lands on whole hours, so today
+is asked for by the hour and aligned to the hour.
+
+### One refused query is only one refused query
+
+The server fails an entire request when any single query inside it is unsupported. A batch that
+comes back with anything missing is therefore retried a query at a time, so an unsupported one
+costs only itself rather than every figure on the screen.
 
 ### The typical range
 

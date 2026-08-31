@@ -152,6 +152,10 @@
     return dayRange(todayStart - days * DAY_MS, todayStart, offsetSecs);
   }
 
+  function startOfToday(offsetSecs) {
+    return Math.floor((Date.now() + offsetSecs * 1000) / DAY_MS) * DAY_MS - offsetSecs * 1000;
+  }
+
   function sameRange(a, b) {
     return !!a && !!b && a.inclusiveStart === b.inclusiveStart && a.exclusiveEnd === b.exclusiveEnd;
   }
@@ -178,11 +182,30 @@
 
   // The entity a screen is scoped to decides what the query must be filtered
   // by: a channel restricts on USER, a single video on VIDEO.
+  // Studio publishes the channel being worked on, which a video or playlist
+  // screen does not otherwise mention.
+  function currentChannelId() {
+    try {
+      if (window.ytcfg && typeof window.ytcfg.get === 'function') {
+        var id = window.ytcfg.get('CHANNEL_ID');
+        if (id) return id;
+      }
+      if (window.ytcfg && window.ytcfg.data_ && window.ytcfg.data_.CHANNEL_ID) return window.ytcfg.data_.CHANNEL_ID;
+    } catch (e) { /* not available on this page */ }
+    var match = location.pathname.match(/\/channel\/([^/]+)/);
+    return match ? match[1] : null;
+  }
+
   function entityRestricts(entity) {
     if (!entity) return null;
     if (entity.channelId) return [{ dimension: { type: 'USER' }, inValues: [entity.channelId] }];
-    if (entity.videoId) return [{ dimension: { type: 'VIDEO' }, inValues: [entity.videoId] }];
-    if (entity.playlistId) return [{ dimension: { type: 'PLAYLIST' }, inValues: [entity.playlistId] }];
+
+    // A video or playlist is restricted by the channel as well. The server
+    // rejects some queries that name only the entity.
+    var channelId = currentChannelId();
+    var owner = channelId ? [{ dimension: { type: 'USER' }, inValues: [channelId] }] : [];
+    if (entity.videoId) return owner.concat([{ dimension: { type: 'VIDEO' }, inValues: [entity.videoId] }]);
+    if (entity.playlistId) return owner.concat([{ dimension: { type: 'PLAYLIST' }, inValues: [entity.playlistId] }]);
     return null;
   }
 
@@ -208,11 +231,11 @@
     var hit = cache.get(key);
     if (!hit) return null;
     if (Date.now() - hit.at > CACHE_TTL_MS) { cache.delete(key); return null; }
-    return hit.result;
+    return hit.promise;
   }
 
-  function cacheSet(key, result) {
-    cache.set(key, { at: Date.now(), result: result });
+  function cacheSet(key, promise) {
+    cache.set(key, { at: Date.now(), promise: promise });
     if (cache.size > 200) cache.delete(cache.keys().next().value);
   }
 
@@ -230,75 +253,105 @@
       if (dimension.strings) labels = dimension.strings.values;
       else if (dimension.dateIds) labels = dimension.dateIds.values;
       else if (dimension.timestamps) labels = dimension.timestamps.values;
+      else if (dimension.enumValues) labels = dimension.enumValues.values;
     }
     return { values: values, labels: labels };
   }
 
-  // Sends every query a surface needs as one request, serves what it can from
-  // cache, and gives up rather than holding a screen open past the deadline.
+  // Sends every query a surface needs as one request, and remembers each one by
+  // the question it asks rather than by the name the caller gave it. A query
+  // asked for twice - by the guess made ahead of a screen and again by the
+  // screen itself - is therefore only ever sent once, and a guess that turns
+  // out not to match simply goes unused.
   function runQueries(ctx, nodes) {
-    var results = {};
     var pending = [];
+    var waits = [];
 
     nodes.forEach(function (node) {
       var key = cacheKey(node);
       var hit = cacheGet(key);
-      if (hit) results[node.key] = hit;
-      else pending.push({ node: node, cacheKey: key });
-    });
-
-    if (pending.length === 0) return Promise.resolve(results);
-
-    return new Promise(function (resolve) {
-      var settled = false;
-      function finish() {
-        if (settled) return;
-        settled = true;
-        resolve(results);
+      if (hit) {
+        waits.push(hit.then(function (table) { return { key: node.key, table: table }; }));
+        return;
       }
-
-      var timer = setTimeout(function () {
-        fault('query deadline reached');
-        finish();
-      }, QUERY_DEADLINE_MS);
-
-      var body = {
-        nodes: pending.map(function (item) { return item.node; }),
-        connectors: [],
-        allowFailureResultNodes: true,
-        context: ctx.context,
-        trackingLabel: 'realview'
-      };
-
-      var xhr = new XMLHttpRequest();
-      nativeOpen.call(xhr, 'POST', location.origin + JOIN_PATH + '?alt=json', true);
-      Object.keys(ctx.headers).forEach(function (name) {
-        try { nativeSetRequestHeader.call(xhr, name, ctx.headers[name]); } catch (e) { /* forbidden header */ }
-      });
-      xhr.withCredentials = true;
-      xhr.onload = function () {
-        clearTimeout(timer);
-        if (xhr.status === 200) {
-          try {
-            var parsed = JSON.parse(xhr.responseText);
-            var answered = parsed.results || parsed.nodes || [];
-            answered.forEach(function (node) {
-              var table = parseResultTable(node);
-              if (!table) return;
-              results[node.key] = table;
-              var match = null;
-              for (var i = 0; i < pending.length; i++) if (pending[i].node.key === node.key) match = pending[i];
-              if (match) cacheSet(match.cacheKey, table);
-            });
-          } catch (e) { log('could not read the query response', e); }
-        } else {
-          fault('query returned status ' + xhr.status);
-        }
-        finish();
-      };
-      xhr.onerror = function () { clearTimeout(timer); fault('query failed'); finish(); };
-      nativeSend.call(xhr, JSON.stringify(body));
+      var resolve;
+      var promise = new Promise(function (r) { resolve = r; });
+      cacheSet(key, promise);
+      pending.push({ node: node, resolve: resolve });
+      waits.push(promise.then(function (table) { return { key: node.key, table: table }; }));
     });
+
+    if (pending.length) sendBatch(ctx, pending, false);
+
+    return Promise.all(waits).then(function (answers) {
+      var results = {};
+      answers.forEach(function (answer) {
+        if (answer.table) results[answer.key] = answer.table;
+      });
+      return results;
+    });
+  }
+
+  // A query the server will not accept fails the whole request it travels in,
+  // so when a batch comes back with anything missing the stragglers are asked
+  // for again one at a time. One unsupported query then costs only itself.
+  function sendBatch(ctx, pending, isolated) {
+    var settled = false;
+    function finish(byKey) {
+      if (settled) return;
+      settled = true;
+
+      var missing = pending.filter(function (item) { return !byKey || !byKey[item.node.key]; });
+      var answered = pending.filter(function (item) { return byKey && byKey[item.node.key]; });
+      answered.forEach(function (item) { item.resolve(byKey[item.node.key]); });
+
+      if (!missing.length) return;
+      if (isolated || pending.length === 1) {
+        missing.forEach(function (item) { item.resolve(null); });
+        return;
+      }
+      log('retrying', missing.length, 'queries on their own');
+      missing.forEach(function (item) { sendBatch(ctx, [item], true); });
+    }
+
+    var timer = setTimeout(function () {
+      fault('query deadline reached');
+      finish(null);
+    }, QUERY_DEADLINE_MS);
+
+    var body = {
+      nodes: pending.map(function (item) { return item.node; }),
+      connectors: [],
+      allowFailureResultNodes: true,
+      context: ctx.context,
+      trackingLabel: 'realview'
+    };
+
+    var xhr = new XMLHttpRequest();
+    nativeOpen.call(xhr, 'POST', location.origin + JOIN_PATH + '?alt=json', true);
+    Object.keys(ctx.headers).forEach(function (name) {
+      try { nativeSetRequestHeader.call(xhr, name, ctx.headers[name]); } catch (e) { /* forbidden header */ }
+    });
+    xhr.withCredentials = true;
+    xhr.onload = function () {
+      clearTimeout(timer);
+      var byKey = {};
+      if (xhr.status === 200) {
+        try {
+          var parsed = JSON.parse(xhr.responseText);
+          var answered = parsed.results || parsed.nodes || [];
+          answered.forEach(function (node) {
+            var table = parseResultTable(node);
+            if (table) byKey[node.key] = table;
+          });
+        } catch (e) { log('could not read the query response', e); }
+      } else {
+        fault('query returned status ' + xhr.status);
+      }
+      finish(byKey);
+    };
+    xhr.onerror = function () { clearTimeout(timer); fault('query failed'); finish(null); };
+    nativeSend.call(xhr, JSON.stringify(body));
   }
 
   /* ---------------------------------------------------- target discovery */
@@ -342,6 +395,14 @@
     return { headline: headline, tables: tables, headers: headers };
   }
 
+  // The gap between the first two buckets gives the granularity, so an hourly
+  // chart and a minute-by-minute one are both covered exactly.
+  function timestampRange(labels) {
+    var stamps = labels.map(Number);
+    var bucket = stamps.length > 1 ? stamps[1] - stamps[0] : HOUR_MS;
+    return { kind: 'hours', startMs: stamps[0], endMs: stamps[stamps.length - 1] + bucket };
+  }
+
   function tableDimension(table) {
     var columns = table.dimensionColumns;
     // A table broken down by two dimensions at once, such as views per hour per
@@ -349,11 +410,13 @@
     if (!columns || columns.length !== 1) return null;
     var column = columns[0];
     if (!column || !column.dimension) return null;
+    // A traffic source, device type and the like arrive as enumerated names.
     var labels = null;
     if (column.strings) labels = column.strings.values;
     else if (column.timestamps) labels = column.timestamps.values;
     else if (column.dateIds) labels = column.dateIds.values;
-    return { type: column.dimension.type, labels: labels };
+    else if (column.enumValues) labels = column.enumValues.values;
+    return { type: column.dimension.type, labels: labels, timestamps: !!column.timestamps };
   }
 
   // "Your channel got 24 views in the last 7 days" quotes the figure the
@@ -401,9 +464,8 @@
     var hourlyRange = null;
     found.tables.forEach(function (entry) {
       var dimension = tableDimension(entry.table);
-      if (!dimension || dimension.type !== 'HOUR' || !dimension.labels || !dimension.labels.length) return;
-      var stamps = dimension.labels.map(Number);
-      hourlyRange = { kind: 'hours', startMs: stamps[0], endMs: stamps[stamps.length - 1] + HOUR_MS };
+      if (!dimension || !dimension.timestamps || !dimension.labels || !dimension.labels.length) return;
+      hourlyRange = timestampRange(dimension.labels);
     });
 
     found.headline.forEach(function (content, index) {
@@ -411,7 +473,34 @@
       if (!range) return;
       var keys = { total: 'rv_total_' + index, series: 'rv_series_' + index, previous: 'rv_prev_' + index };
 
+      // A cumulative chart runs to this moment, and the day-level aggregation
+      // trails the live one by hours - enough to lose most of a new video's
+      // figures - so its total is asked for by clock time instead.
       nodes.push({ key: keys.total, value: { query: buildQuery({ dimensions: [], range: range, restricts: ctx.restricts, currency: ctx.currency }) } });
+
+      // A window that runs to this moment needs today as well, and the day-level
+      // store trails the live one by hours - enough to lose most of a new
+      // video's views. So the finished days are taken from the daily figures and
+      // today is added from the hourly ones. (A query with no dimension at all
+      // is refused over a clock-time range, which is why today comes by hour.)
+      if (content.mainSeries && content.mainSeries.isCumulative) {
+        var todayStart = startOfToday(ctx.offsetSecs);
+        if (todayStart > range.startMs) {
+          keys.base = 'rv_base_' + index;
+          keys.live = 'rv_live_' + index;
+          nodes.push({
+            key: keys.base,
+            value: { query: buildQuery({ dimensions: [], range: dayRange(range.startMs, todayStart, ctx.offsetSecs), restricts: ctx.restricts, currency: ctx.currency }) }
+          });
+          // Bucket boundaries: an hourly query is refused unless its window
+          // lands on whole hours.
+          var liveEnd = Math.ceil(Date.now() / HOUR_MS) * HOUR_MS;
+          nodes.push({
+            key: keys.live,
+            value: { query: buildQuery({ dimensions: [{ type: 'HOUR' }], range: { kind: 'hours', startMs: todayStart, endMs: liveEnd }, restricts: ctx.restricts, currency: ctx.currency }) }
+          });
+        }
+      }
       nodes.push({ key: keys.series, value: { query: buildQuery({ dimensions: [{ type: 'DAY' }], range: range, restricts: ctx.restricts, currency: ctx.currency }) } });
       if (typeof content.previousTotal === 'number') {
         nodes.push({
@@ -439,10 +528,7 @@
       // A realtime table follows the hours its card draws; everything else
       // follows the period the screen was asked for.
       var range = entry.realtime ? hourlyRange : (ctx.range || hourlyRange);
-      if (dimension.type === 'HOUR' && dimension.labels.length) {
-        var stamps = dimension.labels.map(Number);
-        range = { kind: 'hours', startMs: stamps[0], endMs: stamps[stamps.length - 1] + HOUR_MS };
-      }
+      if (dimension.timestamps && dimension.labels.length) range = timestampRange(dimension.labels);
       if (!range) return;
 
       var key = 'rv_table_' + index;
@@ -465,7 +551,7 @@
       plans.push({ kind: 'table', entry: entry, labels: dimension.labels, key: key });
     });
 
-    return { nodes: nodes, plans: plans, found: found, unconverted: hasUnhandledFigures(payload) };
+    return { nodes: nodes, plans: plans, found: found, payload: payload, unconverted: hasUnhandledFigures(payload) };
   }
 
   // Cards whose view figures do not arrive as metric columns cannot be
@@ -486,17 +572,62 @@
     return found;
   }
 
+  // Every figure the screen still reports as a raw view. Wording is only
+  // corrected when there are none left, so a table that could not be converted
+  // is never captioned as though it had been.
+  function anyRawFiguresLeft(payload, converted) {
+    var left = false;
+    (function walk(node, depth) {
+      if (left || depth > 14 || node === null || typeof node !== 'object') return;
+      if (Array.isArray(node)) {
+        for (var i = 0; i < node.length; i++) walk(node[i], depth + 1);
+        return;
+      }
+      if (Array.isArray(node.metricColumns)) {
+        // A table split by two dimensions at once, or one with no rows, draws a
+        // sparkline rather than a captioned figure. Neither can be converted and
+        // neither carries a label, so neither stands in the way of correcting
+        // the wording elsewhere on the screen.
+        var dimensions = node.dimensionColumns;
+        var drawnAsFigures = !dimensions || dimensions.length === 1;
+        var dimension = drawnAsFigures && dimensions ? tableDimension(node) : null;
+        var hasRows = !dimensions || (dimension && dimension.labels && dimension.labels.length);
+
+        if (drawnAsFigures && hasRows) {
+          for (var c = 0; c < node.metricColumns.length; c++) {
+            var column = node.metricColumns[c];
+            if (!column || !column.metric || column.metric.type !== SOURCE_METRIC || !column.counts) continue;
+            if (converted.indexOf(column) === -1) { left = true; return; }
+          }
+        }
+      }
+      var keys = Object.keys(node);
+      for (var k = 0; k < keys.length; k++) walk(node[keys[k]], depth + 1);
+    })(payload, 0);
+    return left;
+  }
+
   function applyConversion(plan, results, ctx) {
     var changed = false;
     var tablesFound = 0;
     var tablesConverted = 0;
+    var converted = [];
 
     plan.plans.forEach(function (item) {
       if (item.kind === 'headline') {
         var total = results[item.keys.total];
-        if (!total || !total.values.length) return;
+        var base = item.keys.base ? results[item.keys.base] : null;
+        var live = item.keys.live ? results[item.keys.live] : null;
 
-        item.content.total = Number(total.values[0]);
+        var figure = null;
+        if (base && base.values.length && live) {
+          figure = Number(base.values[0]) + live.values.reduce(function (a, b) { return a + Number(b); }, 0);
+        } else if (total && total.values.length) {
+          figure = Number(total.values[0]);
+        }
+        if (figure === null) return;
+
+        item.content.total = figure;
         item.content.metric = TARGET_METRIC;
         changed = true;
 
@@ -509,14 +640,22 @@
         else delete item.content.previousTotal;
 
         var series = results[item.keys.series];
-        var datums = item.content.mainSeries && item.content.mainSeries.datums;
+        var mainSeries = item.content.mainSeries;
+        var datums = mainSeries && mainSeries.datums;
         if (series && series.labels && datums) {
           var byDate = {};
           for (var s = 0; s < series.labels.length; s++) byDate[series.labels[s]] = Number(series.values[s]);
+
+          // A "since published" chart plots a running total rather than each
+          // day on its own, and its last point is the figure as it stands now.
+          var running = 0;
           for (var i = 0; i < datums.length; i++) {
             var dateId = toDateId(datums[i].x, ctx.offsetSecs);
-            datums[i].y = Object.prototype.hasOwnProperty.call(byDate, dateId) ? byDate[dateId] : 0;
+            var daily = Object.prototype.hasOwnProperty.call(byDate, dateId) ? byDate[dateId] : 0;
+            running += daily;
+            datums[i].y = mainSeries.isCumulative ? running : daily;
           }
+          if (mainSeries.isCumulative && datums.length) datums[datums.length - 1].y = item.content.total;
         } else if (datums) {
           // Without a matching series the chart would still be drawn from raw
           // views under an engaged label, so drop it rather than mislead.
@@ -532,6 +671,8 @@
         if (typical) item.content.typicalPerformanceTotal = typical;
         else delete item.content.typicalPerformanceTotal;
 
+        // Drawn behind the line, and modelled on the raw metric.
+        delete item.content.typicalPerformanceSeries;
         delete item.content.anomalies;
       }
 
@@ -539,11 +680,23 @@
         tablesFound++;
         var result = results[item.key];
         if (!result || !result.labels) return;
+        converted.push(item.entry.column);
         var byLabel = {};
         for (var r = 0; r < result.labels.length; r++) byLabel[String(result.labels[r])] = Number(result.values[r]);
-        item.entry.column.counts.values = item.labels.map(function (label) {
+        var replacement = item.labels.map(function (label) {
           var name = String(label);
           return Object.prototype.hasOwnProperty.call(byLabel, name) ? byLabel[name] : 0;
+        });
+        item.entry.column.counts.values = replacement;
+
+        // A share-of-views column alongside is worked out from the counts, so
+        // it has to follow them rather than keep describing the raw ones.
+        var total = replacement.reduce(function (a, b) { return a + b; }, 0);
+        (item.entry.table.metricColumns || []).forEach(function (column) {
+          if (!column.percentages || !column.metric || column.metric.type !== SOURCE_METRIC) return;
+          column.percentages.values = replacement.map(function (value) {
+            return total ? (value / total) * 100 : 0;
+          });
         });
         // The metric keeps its name. Studio matches a card's configured metric
         // against the columns it receives, and a column it cannot find makes it
@@ -559,27 +712,18 @@
     // The latest-video snapshot reports its figures outside the shapes handled
     // here, so a screen carrying one is not relabelled either - otherwise its
     // raw count would be captioned as an engaged one.
-    if (tablesFound > 0 && tablesFound === tablesConverted && !plan.unconverted) markConverted('analytics');
+    if (tablesFound > 0 && tablesFound === tablesConverted && !plan.unconverted && !anyRawFiguresLeft(plan.payload, converted)) {
+      markConverted('analytics');
+    }
 
     return changed;
   }
 
-  function convertAnalytics(payload, ctx, prefetch) {
+  function convertAnalytics(payload, ctx) {
     var plan = planConversion(payload, ctx);
     if (plan.nodes.length === 0) return Promise.resolve(false);
 
-    var source = prefetch ? prefetch.promise : runQueries(ctx, plan.nodes);
-
-    return source.then(function (results) {
-      // A speculative prefetch only answers the queries it guessed; anything
-      // still missing is asked for now.
-      var missing = plan.nodes.filter(function (node) { return !results[node.key]; });
-      if (missing.length === 0) return results;
-      return runQueries(ctx, missing).then(function (extra) {
-        Object.keys(extra).forEach(function (key) { results[key] = extra[key]; });
-        return results;
-      });
-    }).then(function (results) {
+    return runQueries(ctx, plan.nodes).then(function (results) {
       var changed = applyConversion(plan, results, ctx);
       if (changed) renameTabConfigs(payload);
       log('analytics converted', { headlines: plan.found.headline.length, tables: plan.found.tables.length, changed: changed });
@@ -973,11 +1117,14 @@
         { key: 'rv_series_0', value: { query: buildQuery({ dimensions: [{ type: 'DAY' }], range: range, restricts: ctx.restricts, currency: ctx.currency }) } },
         { key: 'rv_prev_0', value: { query: buildQuery({ dimensions: [], range: previousRange(range, ctx.offsetSecs), restricts: ctx.restricts, currency: ctx.currency }) } }
       ];
-      var guessedTypical = typicalHistoryNode('rv_typical_0', ctx, range);
-      if (guessedTypical) nodes.push(guessedTypical);
-      return { range: range, promise: runQueries(ctx, nodes) };
+      var guessed = typicalHistoryNode('rv_typical_0', ctx, range);
+      if (guessed) nodes.push(guessed);
+      // Nothing is returned: this only warms the cache, so whichever of these
+      // the screen turns out to need is already answered or on its way.
+      runQueries(ctx, nodes).catch(function () {});
+      return null;
     },
-    run: function (payload, ctx, prefetch) {
+    run: function (payload, ctx) {
       // The response states the dates it actually covers, which settles any
       // disagreement with the range that was guessed from the request. A guess
       // that turns out wrong is discarded rather than used.
@@ -988,9 +1135,7 @@
 
       ctx.range = answered || periodRange(ctx.timePeriod, ctx.offsetSecs) || ctx.range;
 
-      var usable = prefetch && answered && sameRange(prefetch.range, answered) ? prefetch : null;
-      if (prefetch && !usable) log('the guessed period did not match the response, querying again');
-      return convertAnalytics(payload, ctx, usable);
+      return convertAnalytics(payload, ctx);
     }
   };
 

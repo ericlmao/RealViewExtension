@@ -507,14 +507,16 @@ test('repeated faults make the extension stand down instead of repeating', async
     'yta_web/join': () => ({ status: 500, text: 'nope' })
   });
 
+  const attempts = [];
   for (let i = 0; i < 4; i++) {
+    const before = env.sent.filter((entry) => entry.url.includes('join')).length;
     const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
     assert.strictEqual(result.text, screenResponse(), 'every attempt still returns a working screen');
+    attempts.push(env.sent.filter((entry) => entry.url.includes('join')).length - before);
   }
 
-  const joins = env.sent.filter((entry) => entry.url.includes('join')).length;
-  assert.ok(joins <= 4, 'it stopped querying once it had failed repeatedly, made ' + joins + ' attempts');
-  assert.ok(joins >= 1, 'but it did try');
+  assert.ok(attempts[0] >= 1, 'it did try at first');
+  assert.strictEqual(attempts[3], 0, 'and had stopped trying by the end, attempts were ' + attempts.join(','));
   assert.strictEqual(screenCalls, 4, 'and Studio kept getting its screens throughout');
 });
 
@@ -616,6 +618,180 @@ test('a screen carrying a latest-video snapshot is not relabelled', async () => 
   assert.strictEqual(env.attributes['data-realview-converted-analytics'], undefined, 'wording left as Studio wrote it');
   const column = JSON.parse(result.text).cards[2].tableCardData.mainTableData.metricColumns[0];
   assert.deepStrictEqual(column.counts.values, [11, 4], 'the figures it can convert are still converted');
+});
+
+test('a traffic source table is converted and its share column follows', async () => {
+  const payload = {
+    cards: [{
+      tableCardData: {
+        mainTableData: {
+          dimensionColumns: [{ dimension: { type: 'TRAFFIC_SOURCE_TYPE' }, enumValues: { values: ['SUBSCRIBER', 'YT_SEARCH'] } }],
+          metricColumns: [
+            { metric: { type: 'EXTERNAL_VIEWS' }, counts: { values: [800, 200] } },
+            { metric: { type: 'EXTERNAL_VIEWS', asPercentagesOfTotal: true }, percentages: { values: [80, 20] } }
+          ]
+        }
+      }
+    }]
+  };
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'yta_web/join': (body) => ({
+      status: 200,
+      text: JSON.stringify({
+        results: JSON.parse(body).nodes.map((node) => ({
+          key: node.key,
+          value: { resultTable: {
+            dimensionColumns: [{ dimension: { type: 'TRAFFIC_SOURCE_TYPE' }, enumValues: { values: ['YT_SEARCH', 'SUBSCRIBER'] } }],
+            metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: [100, 300] } }]
+          } }
+        }))
+      })
+    })
+  });
+
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const columns = JSON.parse(result.text).cards[0].tableCardData.mainTableData.metricColumns;
+
+  assert.deepStrictEqual(columns[0].counts.values, [300, 100], 'rows matched by enumerated name, not position');
+  assert.deepStrictEqual(columns[1].percentages.values, [75, 25], 'the share column is recomputed from them');
+});
+
+test('a cumulative chart is rebuilt as a running total ending at the figure shown', async () => {
+  const datums = [];
+  for (let i = 7; i >= 1; i--) datums.push({ x: dayStart(-i), y: i * 10 });
+  const payload = {
+    cards: [{
+      keyMetricCardData: {
+        keyMetricTabs: [{
+          metricTabConfig: { metric: 'EXTERNAL_VIEWS' },
+          primaryContent: {
+            metric: 'EXTERNAL_VIEWS',
+            total: 70,
+            mainSeries: { datums, isCumulative: true, timeUnit: 'TIME_PERIOD_UNIT_NTH_DAYS' },
+            typicalPerformanceSeries: { datums: [{ x: 1, y: 2 }] }
+          }
+        }]
+      }
+    }]
+  };
+  const env = createEnvironment({ 'get_screen': JSON.stringify(payload), 'yta_web/join': joinResponder() });
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const content = JSON.parse(result.text).cards[0].keyMetricCardData.keyMetricTabs[0].primaryContent;
+
+  const ys = content.mainSeries.datums.map((d) => d.y);
+  for (let i = 1; i < ys.length; i++) assert.ok(ys[i] >= ys[i - 1], 'the line only ever climbs');
+  assert.strictEqual(ys[ys.length - 1], content.total, 'and ends on the figure the card reports');
+  assert.strictEqual(content.typicalPerformanceSeries, undefined, 'the raw band behind it is dropped');
+});
+
+test("a cumulative total takes today's figures from the live store", async () => {
+  const datums = [];
+  for (let i = 3; i >= 1; i--) datums.push({ x: dayStart(-i), y: i });
+  const payload = { cards: [{ keyMetricCardData: { keyMetricTabs: [{ metricTabConfig: { metric: 'EXTERNAL_VIEWS' }, primaryContent: { metric: 'EXTERNAL_VIEWS', total: 5, mainSeries: { datums, isCumulative: true } } }] } }] };
+  const queries = [];
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'yta_web/join': (body) => { JSON.parse(body).nodes.forEach((n) => queries.push(n)); return joinResponder()(body); }
+  });
+  await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+
+  // Whole days come from the daily store; today comes by the hour, because a
+  // query with no dimension is refused over a clock-time range.
+  const live = queries.filter((n) => n.value.query.timeRange.unixTimeRange);
+  assert.ok(live.length, 'part of the window is asked for by clock time');
+  assert.ok(live.every((n) => n.value.query.dimensions.length > 0), 'and always with a dimension');
+  assert.ok(live.some((n) => (n.value.query.dimensions[0] || {}).type === 'HOUR'), 'today is asked for by the hour');
+
+  const daily = queries.filter((n) => n.value.query.timeRange.dateIdRange && n.value.query.dimensions.length === 0);
+  assert.ok(daily.length, 'the settled days are asked for as whole days');
+});
+
+test('a screen with a figure left raw is not relabelled', async () => {
+  // The join answers the headline but not the table, so one column keeps its
+  // raw figure and the screen must keep Studio's wording.
+  const env = createEnvironment({
+    'get_screen': screenResponse(),
+    'yta_web/join': (body) => ({
+      status: 200,
+      text: JSON.stringify({
+        results: JSON.parse(body).nodes
+          .filter((node) => !node.key.startsWith('rv_table'))
+          .map((node) => ({ key: node.key, value: { resultTable: { metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: [5] } }] } } }))
+      })
+    })
+  });
+  await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  assert.strictEqual(env.attributes['data-realview-converted-analytics'], undefined);
+});
+
+test('one query the server rejects does not take the others down with it', async () => {
+  const env = createEnvironment({
+    'get_screen': screenResponse(),
+    'yta_web/join': (body) => {
+      const nodes = JSON.parse(body).nodes;
+      // The server fails the whole request when any query in it is unsupported.
+      const poisoned = nodes.some((n) => n.value.query.timeRange.unixTimeRange);
+      return {
+        status: 200,
+        text: JSON.stringify({
+          results: nodes.map((n) => (poisoned
+            ? { key: n.key, value: { failure: { errorCode: 'INVALID_ARGUMENT' } } }
+            : joinResponder({ vidA: 11, vidB: 4 })(JSON.stringify({ nodes: [n] })).text
+              ? JSON.parse(joinResponder({ vidA: 11, vidB: 4 })(JSON.stringify({ nodes: [n] })).text).results[0]
+              : { key: n.key, value: {} }))
+        })
+      };
+    }
+  });
+
+  // A cumulative card asks for its total by clock time as well, and that is the
+  // query this fixture refuses.
+  const payload = JSON.parse(screenResponse());
+  payload.cards[1].keyMetricCardData.keyMetricTabs[0].primaryContent.mainSeries.isCumulative = true;
+  env.routes = null;
+
+  const withCumulative = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'yta_web/join': (body) => {
+      const nodes = JSON.parse(body).nodes;
+      const poisoned = nodes.some((n) => n.value.query.timeRange.unixTimeRange);
+      if (poisoned) return { status: 200, text: JSON.stringify({ results: nodes.map((n) => ({ key: n.key, value: { failure: { errorCode: 'INVALID_ARGUMENT' } } })) }) };
+      return joinResponder({ vidA: 11, vidB: 4 })(body);
+    }
+  });
+
+  const result = await request(withCumulative, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const content = JSON.parse(result.text).cards[1].keyMetricCardData.keyMetricTabs[0].primaryContent;
+
+  assert.strictEqual(content.metric, 'ENGAGED_VIEWS', 'the card still converted');
+  assert.strictEqual(content.total, 7, 'from the query the server did accept');
+});
+
+test('a sparkline that cannot be converted does not block the wording', async () => {
+  // Split by two dimensions, so it is skipped by design. It draws a shape
+  // rather than a captioned figure, so it must not hold back the relabelling.
+  const payload = JSON.parse(screenResponse());
+  payload.cards.push({
+    latestActivityCardData: {
+      datas: [{
+        sparkChartData: {
+          dimensionColumns: [
+            { dimension: { type: 'HOUR' }, timestamps: { values: [Date.now() - 3600000, Date.now()] } },
+            { dimension: { type: 'VIDEO' }, strings: { values: ['vidA', 'vidB'] } }
+          ],
+          metricColumns: [{ metric: { type: 'EXTERNAL_VIEWS' }, counts: { values: [3, 4] } }]
+        }
+      }]
+    }
+  });
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'yta_web/join': joinResponder({ vidA: 11, vidB: 4 })
+  });
+  await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  assert.strictEqual(env.attributes['data-realview-converted-analytics'], 'yes');
 });
 
 test('an unrelated request is not touched', async () => {
