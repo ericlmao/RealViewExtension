@@ -188,6 +188,15 @@ history: the same number of days over each of the preceding eight periods, reduc
 value and a quartile range. Fewer than four periods with data and the comparison is dropped
 rather than guessed at.
 
+### A screen that names no period
+
+Most screens name the period they want in the request. The Audience screen does
+not: it asks with a channel and nothing else, and the period it settled on
+appears only in the answer, under `layout.desktopLayout.selectedTimePeriod`. A
+screen with no period has no date range, and a table with no range cannot be
+asked about, so every table on that screen would stay raw. The range is
+therefore taken from the response when the request is silent.
+
 ### Speed
 
 The obvious way to write this costs a round trip: fetch the screen, then fetch its engaged

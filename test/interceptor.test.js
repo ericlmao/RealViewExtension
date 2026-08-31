@@ -1194,6 +1194,30 @@ test('a table split by two dimensions is matched on the pair', async () => {
   assert.deepStrictEqual(columns[1].percentages.values, [30, 10, 60], 'and the shares follow');
 });
 
+test('a screen that names no period takes the one its response states', async () => {
+  // The Audience screen asks for itself with a channel and nothing else. Its
+  // period is only stated in the answer, and without reading it there is no
+  // range and every table on the screen stays raw.
+  const payload = {
+    layout: { desktopLayout: { selectedTimePeriod: { timePeriodType: 'ANALYTICS_TIME_PERIOD_TYPE_WEEK' } } },
+    cards: [{ tableCardData: { mainTableData: {
+      dimensionColumns: [{ dimension: { type: 'VIDEO' }, strings: { values: ['vidA', 'vidB'] } }],
+      metricColumns: [{ metric: { type: 'EXTERNAL_VIEWS' }, counts: { values: [20, 8] } }]
+    } } }]
+  };
+  const request_ = JSON.stringify({
+    context: { client: { clientName: 62 } },
+    screenConfig: { entity: { channelId: CHANNEL }, currency: 'CAD', timeZoneOffsetSecs: OFFSET },
+    desktopState: { tabId: 'ANALYTICS_TAB_ID_AUDIENCE' }
+  });
+
+  const env = createEnvironment({ 'get_screen': JSON.stringify(payload), 'yta_web/join': joinResponder({ vidA: 11, vidB: 4 }) });
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', request_);
+  const column = JSON.parse(result.text).cards[0].tableCardData.mainTableData.metricColumns[0];
+
+  assert.deepStrictEqual(column.counts.values, [11, 4], 'converted from the period the response named');
+});
+
 test('each tab of a by-content-type card is asked for its own kind of content', async () => {
   // One breakdown repeated per content type: the tables are identical apart
   // from the kind of content they cover, so each needs its own query.

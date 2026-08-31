@@ -1724,6 +1724,27 @@
     return text.split('"' + TARGET_METRIC + '"').join('"' + SOURCE_METRIC + '"');
   }
 
+  // The audience screen asks for itself without naming a period: the request
+  // carries only the channel, and the response states which period was chosen.
+  // Without this the screen has no range and every table on it stays raw.
+  function payloadTimePeriod(payload) {
+    var found = null;
+    (function walk(node, depth) {
+      if (found || depth > 14 || node === null || typeof node !== 'object') return;
+      if (Array.isArray(node)) {
+        for (var i = 0; i < node.length; i++) walk(node[i], depth + 1);
+        return;
+      }
+      if (node.selectedTimePeriod && typeof node.selectedTimePeriod.timePeriodType === 'string') {
+        found = node.selectedTimePeriod;
+        return;
+      }
+      var keys = Object.keys(node);
+      for (var k = 0; k < keys.length && !found; k++) walk(node[keys[k]], depth + 1);
+    })(payload, 0);
+    return found;
+  }
+
   var analyticsConverter = {
     // The screen's period is known before its response arrives, so the engaged
     // figures for the headline card are requested at the same time rather than
@@ -1753,7 +1774,8 @@
         ? seriesRange(probe.headline[0].mainSeries && probe.headline[0].mainSeries.datums, ctx.offsetSecs)
         : null;
 
-      ctx.range = answered || periodRange(ctx.timePeriod, ctx.offsetSecs) || ctx.range;
+      ctx.range = answered || periodRange(ctx.timePeriod, ctx.offsetSecs) || ctx.range ||
+        periodRange(payloadTimePeriod(payload), ctx.offsetSecs);
 
       return convertAnalytics(payload, ctx);
     }
