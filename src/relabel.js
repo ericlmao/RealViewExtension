@@ -20,6 +20,19 @@
     return document.documentElement.getAttribute('data-realview-converted-' + name) === 'yes';
   }
 
+  // Every rewording is remembered, so that a response arriving later - a card
+  // fetched as it scrolls into view, say - can withdraw the verdict and put
+  // Studio's own wording back rather than leave a raw figure captioned wrongly.
+  var rewritten = [];
+
+  function revert() {
+    for (var i = 0; i < rewritten.length; i++) {
+      var entry = rewritten[i];
+      if (entry.node.nodeValue === entry.after) entry.node.nodeValue = entry.before;
+    }
+    rewritten.length = 0;
+  }
+
   function active() {
     var path = location.pathname;
     if (/\/analytics(\/|$)/.test(path)) return converted('analytics');
@@ -70,7 +83,9 @@
       if (!match) continue;
       if (skip(node)) return;
       var word = match[2];
-      node.nodeValue = text.replace(word, word === 'Views' ? 'Engaged views' : 'engaged views');
+      var after = text.replace(word, word === 'Views' ? 'Engaged views' : 'engaged views');
+      rewritten.push({ node: node, before: text, after: after });
+      node.nodeValue = after;
       return;
     }
   }
@@ -113,7 +128,10 @@
 
   // The flags are set once a response has been converted, which happens after
   // the first sweep, so run again when one appears.
-  new MutationObserver(function () { sweep(document.body); }).observe(document.documentElement, {
+  new MutationObserver(function () {
+    if (active()) sweep(document.body);
+    else revert();
+  }).observe(document.documentElement, {
     attributes: true,
     attributeFilter: [
       'data-realview-converted-analytics',

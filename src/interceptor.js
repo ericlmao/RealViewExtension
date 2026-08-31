@@ -88,7 +88,14 @@
   // metric are relabelled by the companion content script, but only once this
   // flag says their numbers were really replaced.
   function markConverted(name) {
+    if (document.documentElement.getAttribute('data-realview-converted-' + name) === 'no') return;
     document.documentElement.setAttribute('data-realview-converted-' + name, 'yes');
+  }
+
+  // A card can arrive after the screen it belongs to, so a later response that
+  // leaves figures raw has to be able to withdraw the verdict of an earlier one.
+  function markUnconverted(name) {
+    document.documentElement.setAttribute('data-realview-converted-' + name, 'no');
   }
 
   /* ------------------------------------------------------------ date ids */
@@ -380,7 +387,7 @@
       if (Array.isArray(node.metricColumns)) {
         for (var c = 0; c < node.metricColumns.length; c++) {
           var column = node.metricColumns[c];
-          if (column && column.metric && column.metric.type === SOURCE_METRIC && column.counts) {
+          if (column && column.metric && column.metric.type === SOURCE_METRIC && (column.counts || column.percentages)) {
             tables.push({ table: node, column: column, realtime: realtime });
           }
         }
@@ -575,25 +582,69 @@
       plans.push({ kind: 'table', entry: entry, labels: dimension.labels, key: key });
     });
 
-    return { nodes: nodes, plans: plans, found: found, payload: payload, unconverted: hasUnhandledFigures(payload) };
+    return { nodes: nodes, plans: plans, found: found, payload: payload };
   }
 
-  // Cards whose view figures do not arrive as metric columns cannot be
-  // converted by the substitution above. The latest-video snapshot is one:
-  // it reports a video's count and its standing among recent uploads.
-  function hasUnhandledFigures(payload) {
-    var found = false;
-    (function walk(node, depth) {
-      if (found || depth > 14 || node === null || typeof node !== 'object') return;
+  // Not every card reports its figures as metric columns. The latest-video
+  // snapshot does not, and neither does anything Studio adds in future. Rather
+  // than enumerate them, a card that mentions the raw metric anywhere in its
+  // data and had nothing converted inside it is taken at its word: it is still
+  // showing raw views, and the wording on that screen must be left alone.
+  // Serialises a card's data without the notices attached to it. Those name the
+  // raw metric - they are the "views are counted differently now" warnings - so
+  // including them would make every card look as though it reported raw views.
+  var NOTICE_KEYS = { anomalies: 1, columnAnomalies: 1, anomalyContext: 1 };
+
+  function describeFigures(data) {
+    return JSON.stringify(data, function (key, value) {
+      return Object.prototype.hasOwnProperty.call(NOTICE_KEYS, key) ? undefined : value;
+    });
+  }
+
+  function cardsLeftRaw(payload, converted) {
+    if (!payload || !Array.isArray(payload.cards)) return false;
+
+    function holds(node, column, depth) {
+      if (depth > 16 || node === null || typeof node !== 'object') return false;
+      if (node === column) return true;
       if (Array.isArray(node)) {
-        for (var i = 0; i < node.length; i++) walk(node[i], depth + 1);
-        return;
+        for (var i = 0; i < node.length; i++) if (holds(node[i], column, depth + 1)) return true;
+        return false;
       }
-      if (node.entitySnapshotCardData) { found = true; return; }
       var keys = Object.keys(node);
-      for (var k = 0; k < keys.length; k++) walk(node[keys[k]], depth + 1);
-    })(payload, 0);
-    return found;
+      for (var k = 0; k < keys.length; k++) if (holds(node[keys[k]], column, depth + 1)) return true;
+      return false;
+    }
+
+    for (var c = 0; c < payload.cards.length; c++) {
+      var card = payload.cards[c];
+      if (!card || card.isHidden) continue;
+
+      var dataKeys = Object.keys(card).filter(function (key) { return /CardData$/.test(key); });
+      for (var d = 0; d < dataKeys.length; d++) {
+        var data = card[dataKeys[d]];
+        var text;
+        try { text = describeFigures(data); } catch (e) { continue; }
+        // Either it names the raw metric, or it reports a view count under its
+        // own name, as the latest-video snapshot does.
+        var mentionsMetric = text.indexOf('"' + SOURCE_METRIC + '"') !== -1;
+        var mentionsCount = /"(externalViewCount|viewCount|views)"\s*:/.test(text);
+        if (!mentionsMetric && !mentionsCount) continue;
+
+        // A card holding metric columns has already been judged one column at a
+        // time, sparklines excepted. This is about the other kind: a card that
+        // reports its figures some other way entirely, which the substitution
+        // never had a chance to touch.
+        if (text.indexOf('"metricColumns"') !== -1) continue;
+
+        var touched = converted.some(function (item) { return holds(data, item, 0); });
+        if (!touched) {
+          log('left raw by an unfamiliar card:', dataKeys[d]);
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   // Every figure the screen still reports as a raw view. Wording is only
@@ -620,7 +671,8 @@
         if (drawnAsFigures && hasRows) {
           for (var c = 0; c < node.metricColumns.length; c++) {
             var column = node.metricColumns[c];
-            if (!column || !column.metric || column.metric.type !== SOURCE_METRIC || !column.counts) continue;
+            if (!column || !column.metric || column.metric.type !== SOURCE_METRIC) continue;
+            if (!column.counts && !column.percentages) continue;
             if (converted.indexOf(column) === -1) { left = true; return; }
           }
         }
@@ -698,6 +750,7 @@
 
         item.content.total = figure;
         item.content.metric = TARGET_METRIC;
+        converted.push(item.content);
         changed = true;
 
         item.headers.forEach(function (header) {
@@ -740,11 +793,13 @@
           var name = String(label);
           return Object.prototype.hasOwnProperty.call(byLabel, name) ? byLabel[name] : 0;
         });
-        item.entry.column.counts.values = replacement;
-
-        // A share-of-views column alongside is worked out from the counts, so
-        // it has to follow them rather than keep describing the raw ones.
         var total = replacement.reduce(function (a, b) { return a + b; }, 0);
+
+        if (item.entry.column.counts) item.entry.column.counts.values = replacement;
+
+        // Some tables report only each row's share of the views rather than the
+        // views themselves. Those shares describe the raw metric until they are
+        // worked out again from the figures fetched here.
         (item.entry.table.metricColumns || []).forEach(function (column) {
           if (!column.percentages || !column.metric || column.metric.type !== SOURCE_METRIC) return;
           column.percentages.values = replacement.map(function (value) {
@@ -765,9 +820,9 @@
     // The latest-video snapshot reports its figures outside the shapes handled
     // here, so a screen carrying one is not relabelled either - otherwise its
     // raw count would be captioned as an engaged one.
-    if (tablesFound > 0 && tablesFound === tablesConverted && !plan.unconverted && !anyRawFiguresLeft(plan.payload, converted)) {
-      markConverted('analytics');
-    }
+    var leftRaw = anyRawFiguresLeft(plan.payload, converted) || cardsLeftRaw(plan.payload, converted);
+    if (tablesFound > 0 && tablesFound === tablesConverted && !leftRaw) markConverted('analytics');
+    else if (tablesFound > 0 || leftRaw) markUnconverted('analytics');
 
     return changed;
   }

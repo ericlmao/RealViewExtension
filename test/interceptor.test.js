@@ -231,7 +231,7 @@ test('a half-converted screen is not flagged for relabelling', async () => {
     }
   });
   await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
-  assert.strictEqual(env.attributes['data-realview-converted-analytics'], undefined, 'not flagged');
+  assert.notStrictEqual(env.attributes['data-realview-converted-analytics'], 'yes', 'not flagged for relabelling');
 });
 
 test('the realtime table uses its own 48 hours, not the screen period', async () => {
@@ -615,7 +615,7 @@ test('a screen carrying a latest-video snapshot is not relabelled', async () => 
   });
   const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
 
-  assert.strictEqual(env.attributes['data-realview-converted-analytics'], undefined, 'wording left as Studio wrote it');
+  assert.notStrictEqual(env.attributes['data-realview-converted-analytics'], 'yes', 'wording left as Studio wrote it');
   const column = JSON.parse(result.text).cards[2].tableCardData.mainTableData.metricColumns[0];
   assert.deepStrictEqual(column.counts.values, [11, 4], 'the figures it can convert are still converted');
 });
@@ -722,7 +722,7 @@ test('a screen with a figure left raw is not relabelled', async () => {
     })
   });
   await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
-  assert.strictEqual(env.attributes['data-realview-converted-analytics'], undefined);
+  assert.strictEqual(env.attributes['data-realview-converted-analytics'], 'no', 'and says so, in case an earlier response said otherwise');
 });
 
 test('one query the server rejects does not take the others down with it', async () => {
@@ -832,6 +832,64 @@ test('several points inside one bucket are not each credited with it', async () 
   const ys = content.mainSeries.datums.map((d) => d.y);
   assert.deepStrictEqual(ys, [100, 200, 300, 400, 500, 600], 'and the line is their running total');
   assert.strictEqual(ys[ys.length - 1], content.total, 'ending exactly on the figure shown');
+});
+
+test('a card reporting figures in an unfamiliar shape withdraws the relabelling', async () => {
+  // Nothing here is a metric column, so the substitution had no way in. Saying
+  // nothing would leave the card's raw count captioned as an engaged one.
+  const payload = JSON.parse(screenResponse());
+  payload.cards.push({ videoTrafficSourcesCardData: { rows: [{ source: 'BROWSE', metric: 'EXTERNAL_VIEWS', value: 130400 }] } });
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'yta_web/join': joinResponder({ vidA: 11, vidB: 4 })
+  });
+  await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  assert.strictEqual(env.attributes['data-realview-converted-analytics'], 'no');
+});
+
+test('a hidden card is not treated as showing anything', async () => {
+  const payload = JSON.parse(screenResponse());
+  payload.cards.push({ isHidden: true, videoTrafficSourcesCardData: { rows: [{ metric: 'EXTERNAL_VIEWS', value: 1 }] } });
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'yta_web/join': joinResponder({ vidA: 11, vidB: 4 })
+  });
+  await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  assert.strictEqual(env.attributes['data-realview-converted-analytics'], 'yes');
+});
+
+test('a share-only table is converted from figures fetched for it', async () => {
+  const payload = {
+    cards: [{
+      tableCardData: {
+        mainTableData: {
+          dimensionColumns: [{ dimension: { type: 'COUNTRY' }, strings: { values: ['US', 'GB'] } }],
+          metricColumns: [{ metric: { type: 'EXTERNAL_VIEWS', asPercentagesOfTotal: true }, percentages: { values: [90, 10] } }]
+        }
+      }
+    }]
+  };
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'yta_web/join': (body) => ({
+      status: 200,
+      text: JSON.stringify({
+        results: JSON.parse(body).nodes.map((node) => ({
+          key: node.key,
+          value: { resultTable: {
+            dimensionColumns: [{ dimension: { type: 'COUNTRY' }, strings: { values: ['US', 'GB'] } }],
+            metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: [30, 70] } }]
+          } }
+        }))
+      })
+    })
+  });
+
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const column = JSON.parse(result.text).cards[0].tableCardData.mainTableData.metricColumns[0];
+  assert.deepStrictEqual(column.percentages.values, [30, 70], 'the shares describe the engaged figures now');
 });
 
 test('an unrelated request is not touched', async () => {

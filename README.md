@@ -73,14 +73,22 @@ On the channel this was built against the difference is real: over 365 days the 
   over exactly the hours the card draws.
 - **Channel dashboard** — the summary card and top content.
 - **Content tab** — the video list's lifetime view counts.
-- **Traffic sources** — the tables that break views down by where viewers came from, along with
-  the share-of-views column beside them, which is recomputed from the converted figures.
+- **Traffic sources, countries, devices and the rest** — the tables that break views down by
+  something, including the ones that report only each row's share rather than the views
+  themselves; those shares are worked out again from the converted figures.
 
-Not covered: the **latest video performance** card, whose figures arrive in a shape the
-substitution cannot reach. More generally, a screen is only relabelled once every figure on it
-that Studio draws as a number has really been converted, so a raw count is never captioned as an
-engaged one. Sparklines split by two dimensions at once are the one exception: they cannot be
-converted and carry no caption, so they do not hold the wording back.
+Not covered: cards that report their figures in some shape other than a table of metric columns
+— the **latest video performance** card is one. Rather than enumerate them, any card that
+mentions views and had nothing converted inside it is taken at its word, and the wording on that
+screen is left as Studio wrote it.
+
+A screen is only relabelled once every figure on it has really been converted, so a raw count is
+never captioned as an engaged one. Two things are exempt: sparklines split by two dimensions at
+once, which cannot be converted and carry no caption, and the "views are counted differently now"
+notices, which name the metric without reporting any figure.
+
+Because a card can arrive after the screen it belongs to, that verdict can be withdrawn: a later
+response that leaves figures raw puts Studio's own wording back.
 
 `relabel.js` corrects the wording on the analytics screens, the dashboard and the video list —
 and only once the interceptor confirms the numbers on that surface really changed.
