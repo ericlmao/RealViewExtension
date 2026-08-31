@@ -794,6 +794,46 @@ test('a sparkline that cannot be converted does not block the wording', async ()
   assert.strictEqual(env.attributes['data-realview-converted-analytics'], 'yes');
 });
 
+test('several points inside one bucket are not each credited with it', async () => {
+  // A "since published" chart draws many points inside the first day. Adding
+  // that day's figure once per point inflated the line to several times the
+  // real total before it snapped back at the end.
+  const dayOne = dayStart(-1);
+  const datums = [];
+  for (let i = 0; i < 6; i++) datums.push({ x: dayOne + i * 3 * 3600000, y: 1000 * (i + 1) });
+
+  const payload = { cards: [{ keyMetricCardData: { keyMetricTabs: [{
+    metricTabConfig: { metric: 'EXTERNAL_VIEWS' },
+    primaryContent: { metric: 'EXTERNAL_VIEWS', total: 90000, mainSeries: { datums, isCumulative: true } }
+  }] } }] };
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'yta_web/join': (body) => ({
+      status: 200,
+      text: JSON.stringify({
+        results: JSON.parse(body).nodes.map((node) => {
+          const dimension = (node.value.query.dimensions[0] || {}).type;
+          if (dimension !== 'HOUR') return { key: node.key, value: { resultTable: { metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: [999999] } }] } } };
+          // Six hourly buckets of 100 each, spread across the same day.
+          const labels = [];
+          const values = [];
+          for (let i = 0; i < 6; i++) { labels.push(dayOne + i * 3 * 3600000); values.push(100); }
+          return { key: node.key, value: { resultTable: { dimensionColumns: [{ dimension: { type: 'HOUR' }, timestamps: { values: labels } }], metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values } }] } } };
+        })
+      })
+    })
+  });
+
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const content = JSON.parse(result.text).cards[0].keyMetricCardData.keyMetricTabs[0].primaryContent;
+
+  assert.strictEqual(content.total, 600, 'the figure is the sum of the buckets, counted once each');
+  const ys = content.mainSeries.datums.map((d) => d.y);
+  assert.deepStrictEqual(ys, [100, 200, 300, 400, 500, 600], 'and the line is their running total');
+  assert.strictEqual(ys[ys.length - 1], content.total, 'ending exactly on the figure shown');
+});
+
 test('an unrelated request is not touched', async () => {
   const env = createEnvironment({ 'creator/get_creator_channels': '{"channels":[]}' });
   const result = await request(env, 'https://studio.youtube.com/youtubei/v1/creator/get_creator_channels?alt=json', '{}');

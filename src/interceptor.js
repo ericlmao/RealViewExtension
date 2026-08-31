@@ -472,36 +472,52 @@
       var range = seriesRange(content.mainSeries && content.mainSeries.datums, ctx.offsetSecs);
       if (!range) return;
       var keys = { total: 'rv_total_' + index, series: 'rv_series_' + index, previous: 'rv_prev_' + index };
+      var cumulative = !!(content.mainSeries && content.mainSeries.isCumulative);
 
-      // A cumulative chart runs to this moment, and the day-level aggregation
-      // trails the live one by hours - enough to lose most of a new video's
-      // figures - so its total is asked for by clock time instead.
-      nodes.push({ key: keys.total, value: { query: buildQuery({ dimensions: [], range: range, restricts: ctx.restricts, currency: ctx.currency }) } });
-
-      // A window that runs to this moment needs today as well, and the day-level
-      // store trails the live one by hours - enough to lose most of a new
-      // video's views. So the finished days are taken from the daily figures and
-      // today is added from the hourly ones. (A query with no dimension at all
-      // is refused over a clock-time range, which is why today comes by hour.)
-      if (content.mainSeries && content.mainSeries.isCumulative) {
+      if (cumulative) {
+        // A chart that runs to this moment is rebuilt from time buckets rather
+        // than from a single total, so the line and the figure above it are the
+        // same arithmetic and cannot disagree.
+        //
+        // The buckets have to be at least as fine as the chart's own points: a
+        // "since published" chart draws several points inside one day, and a
+        // day-sized bucket cannot say how much of that day had accrued by each
+        // of them. Hours are used for a window short enough to make that
+        // sensible, and days plus today's hours for anything longer, since the
+        // daily store trails the live one by hours - most of a new video's
+        // views.
         var todayStart = startOfToday(ctx.offsetSecs);
-        if (todayStart > range.startMs) {
-          keys.base = 'rv_base_' + index;
-          keys.live = 'rv_live_' + index;
+        var liveStart = Math.min(Math.floor(range.startMs / HOUR_MS) * HOUR_MS, todayStart);
+        var liveEnd = Math.ceil(Date.now() / HOUR_MS) * HOUR_MS;
+
+        if (Date.now() - range.startMs <= HOURLY_WINDOW_LIMIT_MS) {
+          keys.hours = 'rv_hours_' + index;
           nodes.push({
-            key: keys.base,
-            value: { query: buildQuery({ dimensions: [], range: dayRange(range.startMs, todayStart, ctx.offsetSecs), restricts: ctx.restricts, currency: ctx.currency }) }
+            key: keys.hours,
+            value: { query: buildQuery({ dimensions: [{ type: 'HOUR' }], range: { kind: 'hours', startMs: liveStart, endMs: liveEnd }, restricts: ctx.restricts, currency: ctx.currency }) }
           });
-          // Bucket boundaries: an hourly query is refused unless its window
-          // lands on whole hours.
-          var liveEnd = Math.ceil(Date.now() / HOUR_MS) * HOUR_MS;
+        } else {
+          keys.days = 'rv_days_' + index;
           nodes.push({
-            key: keys.live,
-            value: { query: buildQuery({ dimensions: [{ type: 'HOUR' }], range: { kind: 'hours', startMs: todayStart, endMs: liveEnd }, restricts: ctx.restricts, currency: ctx.currency }) }
+            key: keys.days,
+            value: { query: buildQuery({ dimensions: [{ type: 'DAY' }], range: dayRange(range.startMs, todayStart, ctx.offsetSecs), restricts: ctx.restricts, currency: ctx.currency }) }
           });
+          if (liveEnd > todayStart) {
+            keys.hours = 'rv_hours_' + index;
+            nodes.push({
+              key: keys.hours,
+              value: { query: buildQuery({ dimensions: [{ type: 'HOUR' }], range: { kind: 'hours', startMs: todayStart, endMs: liveEnd }, restricts: ctx.restricts, currency: ctx.currency }) }
+            });
+          }
         }
       }
-      nodes.push({ key: keys.series, value: { query: buildQuery({ dimensions: [{ type: 'DAY' }], range: range, restricts: ctx.restricts, currency: ctx.currency }) } });
+
+      // Kept as a fallback for a cumulative card whose buckets are refused.
+      nodes.push({ key: keys.total, value: { query: buildQuery({ dimensions: [], range: range, restricts: ctx.restricts, currency: ctx.currency }) } });
+      if (!cumulative) {
+        nodes.push({ key: keys.series, value: { query: buildQuery({ dimensions: [{ type: 'DAY' }], range: range, restricts: ctx.restricts, currency: ctx.currency }) } });
+      }
+
       if (typeof content.previousTotal === 'number') {
         nodes.push({
           key: keys.previous,
@@ -516,7 +532,15 @@
         }
       }
 
-      plans.push({ kind: 'headline', content: content, rawTotal: content.total, range: range, keys: keys, headers: found.headers });
+      plans.push({
+        kind: 'headline',
+        content: content,
+        rawTotal: content.total,
+        range: range,
+        cumulative: cumulative,
+        keys: keys,
+        headers: found.headers
+      });
     });
 
     found.tables.forEach(function (entry, index) {
@@ -607,6 +631,44 @@
     return left;
   }
 
+  // Turns whatever the queries answered into buckets of {startMs, value}, in
+  // time order, whether they came back as days or as hours.
+  function collectBuckets(item, results, ctx) {
+    var buckets = [];
+
+    function add(table, toMs) {
+      if (!table || !table.labels) return;
+      for (var i = 0; i < table.labels.length; i++) {
+        buckets.push({ startMs: toMs(table.labels[i]), value: Number(table.values[i]) });
+      }
+    }
+
+    add(results[item.keys.days], function (label) { return dateIdToMs(Number(label)) - ctx.offsetSecs * 1000; });
+    add(results[item.keys.hours], function (label) { return Number(label); });
+    if (!item.cumulative) add(results[item.keys.series], function (label) { return dateIdToMs(Number(label)) - ctx.offsetSecs * 1000; });
+
+    buckets.sort(function (a, b) { return a.startMs - b.startMs; });
+    return buckets;
+  }
+
+  // Each point on the line is worth everything that had accrued by the moment
+  // it marks, so several points inside one bucket share that bucket's figure
+  // rather than each being credited with it.
+  function fillSeries(datums, buckets, cumulative) {
+    var index = 0;
+    var running = 0;
+    for (var d = 0; d < datums.length; d++) {
+      var upTo = datums[d].x;
+      var latest = 0;
+      while (index < buckets.length && buckets[index].startMs <= upTo) {
+        running += buckets[index].value;
+        latest = buckets[index].value;
+        index++;
+      }
+      datums[d].y = cumulative ? running : latest;
+    }
+  }
+
   function applyConversion(plan, results, ctx) {
     var changed = false;
     var tablesFound = 0;
@@ -615,15 +677,22 @@
 
     plan.plans.forEach(function (item) {
       if (item.kind === 'headline') {
+        // Whatever the granularity, the answer becomes a list of buckets in
+        // time order. The figure is their sum and the line is their running
+        // total, so the two always agree.
+        var buckets = collectBuckets(item, results, ctx);
         var total = results[item.keys.total];
-        var base = item.keys.base ? results[item.keys.base] : null;
-        var live = item.keys.live ? results[item.keys.live] : null;
 
+        // A fixed window keeps the figure the server gives for it. A window
+        // running to this moment has no such figure that is up to date, so it
+        // is the sum of the buckets the line is drawn from.
         var figure = null;
-        if (base && base.values.length && live) {
-          figure = Number(base.values[0]) + live.values.reduce(function (a, b) { return a + Number(b); }, 0);
+        if (item.cumulative && buckets.length) {
+          figure = buckets.reduce(function (sum, bucket) { return sum + bucket.value; }, 0);
         } else if (total && total.values.length) {
           figure = Number(total.values[0]);
+        } else if (buckets.length) {
+          figure = buckets.reduce(function (sum, bucket) { return sum + bucket.value; }, 0);
         }
         if (figure === null) return;
 
@@ -639,33 +708,17 @@
         if (previous && previous.values.length) item.content.previousTotal = Number(previous.values[0]);
         else delete item.content.previousTotal;
 
-        var series = results[item.keys.series];
         var mainSeries = item.content.mainSeries;
         var datums = mainSeries && mainSeries.datums;
-        if (series && series.labels && datums) {
-          var byDate = {};
-          for (var s = 0; s < series.labels.length; s++) byDate[series.labels[s]] = Number(series.values[s]);
-
-          // A "since published" chart plots a running total rather than each
-          // day on its own, and its last point is the figure as it stands now.
-          var running = 0;
-          for (var i = 0; i < datums.length; i++) {
-            var dateId = toDateId(datums[i].x, ctx.offsetSecs);
-            var daily = Object.prototype.hasOwnProperty.call(byDate, dateId) ? byDate[dateId] : 0;
-            running += daily;
-            datums[i].y = mainSeries.isCumulative ? running : daily;
-          }
-          if (mainSeries.isCumulative && datums.length) datums[datums.length - 1].y = item.content.total;
+        if (buckets.length && datums) {
+          fillSeries(datums, buckets, item.cumulative);
+          if (item.cumulative && datums.length) datums[datums.length - 1].y = figure;
         } else if (datums) {
-          // Without a matching series the chart would still be drawn from raw
-          // views under an engaged label, so drop it rather than mislead.
+          // Without figures to draw it from, the line would still be the raw
+          // metric under an engaged label, so drop it rather than mislead.
           delete item.content.mainSeries;
         }
 
-        // The server models a typical range for raw views only, so the card's
-        // own one is replaced with a band worked out from the channel's engaged
-        // history. The anomaly is the "views are counted differently now"
-        // notice, which does not apply to a card no longer showing those views.
         var history = item.keys.typical ? results[item.keys.typical] : null;
         var typical = history ? typicalFromHistory(history, ctx, item.range) : null;
         if (typical) item.content.typicalPerformanceTotal = typical;
@@ -1038,6 +1091,8 @@
   // will not calculate: the same number of days, over each of the preceding
   // periods, gives a middle value and a band to compare today's figure against.
   var TYPICAL_PERIODS = 8;
+  // Beyond this the hourly buckets become too many to ask for in one go.
+  var HOURLY_WINDOW_LIMIT_MS = 14 * DAY_MS;
 
   function typicalHistoryNode(key, ctx, range) {
     if (!ctx.restricts.length || range.kind !== 'days') return null;

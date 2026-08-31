@@ -121,14 +121,19 @@ converted.
 ### Charts that run to this moment
 
 A video's "since published" chart plots a running total rather than each day on its own, and its
-last point is the figure as it stands now. Those are rebuilt as running totals ending on the
-figure the card reports.
+last point is the figure as it stands now.
 
-That figure cannot come from the daily store alone: it trails the live one by hours, which on a
-day-old video is most of its views. So the settled days are taken from the daily figures and
-today is added from the hourly ones. A query with no dimension at all is refused over a
-clock-time range, and an hourly one is refused unless its window lands on whole hours, so today
-is asked for by the hour and aligned to the hour.
+Both the line and the figure above it are built from the same list of time buckets, so the two
+cannot disagree: the figure is their sum, the line is their running total. The buckets have to be
+at least as fine as the chart's own points — such a chart draws several points inside a single
+day, and a day-sized bucket cannot say how much of that day had accrued by each of them. Hours
+are used for a window short enough to make that sensible, days plus today's hours for anything
+longer, since the daily store trails the live one by hours, which on a day-old video is most of
+its views.
+
+Two rules of the query endpoint shape this, both found by experiment: a query with no dimension
+at all is refused over a clock-time range, and an hourly one is refused unless its window lands
+on whole hours.
 
 ### One refused query is only one refused query
 
