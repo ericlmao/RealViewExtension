@@ -408,7 +408,25 @@
       // Some cards carry a plain view count for a video alongside their own
       // figures - the retention curve is one - rather than a metric column.
       if (typeof node.videoId === 'string' && node.metricTotals && typeof node.metricTotals.views === 'number') {
-        entities.push({ videoId: node.videoId, totals: node.metricTotals });
+        entities.push({
+          videoId: node.videoId,
+          apply: (function (totals) { return function (value) { totals.views = value; }; })(node.metricTotals),
+          holder: node.metricTotals
+        });
+      }
+
+      // The latest-video card reports each of its metrics as a row of its own,
+      // naming the video once at the top.
+      if (node.video && typeof node.video.externalVideoId === 'string' && node.metricsTable && Array.isArray(node.metricsTable.metricRows)) {
+        var snapshotId = node.video.externalVideoId;
+        node.metricsTable.metricRows.forEach(function (row) {
+          if (!row.metric || row.metric.type !== SOURCE_METRIC || !row.value || typeof row.value.double !== 'number') return;
+          entities.push({
+            videoId: snapshotId,
+            apply: (function (target) { return function (value) { target.value.double = value; }; })(row),
+            holder: row
+          });
+        });
       }
       if (node.personalizedHeaderCardData && typeof node.personalizedHeaderCardData.title === 'string') {
         headers.push(node.personalizedHeaderCardData);
@@ -932,8 +950,8 @@
         for (var e = 0; e < counts.labels.length; e++) byVideo[counts.labels[e]] = Number(counts.values[e]);
         item.entities.forEach(function (entity) {
           if (!Object.prototype.hasOwnProperty.call(byVideo, entity.videoId)) return;
-          entity.totals.views = byVideo[entity.videoId];
-          converted.push(entity.totals);
+          entity.apply(byVideo[entity.videoId]);
+          converted.push(entity.holder);
           changed = true;
         });
       }
@@ -1139,13 +1157,15 @@
       for (var k = 0; k < keys.length; k++) walk(node[keys[k]], depth + 1);
     })(parsed, 0);
 
-    if (!channelId) return null;
+    // Without a channel to restrict by there is nothing to look up, but the
+    // metric swap still applies, so a context is returned either way.
     return {
       context: parsed.context,
       headers: xhr.__realViewHeaders || {},
       currency: currency,
       offsetSecs: 0,
-      restricts: [{ dimension: { type: 'USER' }, inValues: [channelId] }],
+      channelId: channelId,
+      restricts: channelId ? [{ dimension: { type: 'USER' }, inValues: [channelId] }] : [],
       range: range
     };
   }
@@ -1263,7 +1283,7 @@
   // completes the caller's request with the result. Any failure at all falls
   // back to the untouched response.
   function proxy(xhr, body, rewriteBody, convert) {
-    var ctx = requestContext(xhr, body);
+    var ctx = (convert.context || requestContext)(xhr, body);
     if (!ctx) { nativeSend.call(xhr, body); return; }
 
     var prefetch = null;
@@ -1465,6 +1485,38 @@
   // realtime card, so there is nothing worth guessing ahead of time.
   var cardsConverter = { run: analyticsConverter.run };
 
+  var dashboardConverter = {
+    context: dashboardContext,
+    prefetch: function (ctx) {
+      if (ctx && ctx.range) computeTypical(ctx, ctx.range).then(function (stats) { ctx.typical = stats; }).catch(function () {});
+      return null;
+    },
+    run: function (payload, ctx) {
+      // The queries were asked for the engaged metric, so the answer names it;
+      // the caller's own bookkeeping expects the name it asked with.
+      renameMetricDeeply(payload, TARGET_METRIC, SOURCE_METRIC);
+      if (ctx.typical) applyTypical(payload, ctx.typical);
+      markConverted('dashboard');
+
+      return convertAnalytics(payload, ctx).then(function () { return true; });
+    }
+  };
+
+  function renameMetricDeeply(node, from, to) {
+    if (node === null || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      for (var i = 0; i < node.length; i++) {
+        if (node[i] === from) node[i] = to;
+        else renameMetricDeeply(node[i], from, to);
+      }
+      return;
+    }
+    Object.keys(node).forEach(function (key) {
+      if (node[key] === from) node[key] = to;
+      else renameMetricDeeply(node[key], from, to);
+    });
+  }
+
   var videoListConverter = {
     run: function (payload, ctx) { return convertVideoList(payload, ctx); }
   };
@@ -1514,8 +1566,14 @@
     // The dashboard's own queries name their metric, so they only need the
     // metric swapped on the way out and restored on the way in. Queries this
     // extension issues carry their own label and are left alone.
-    var namesItsOwnMetric = url.indexOf(JOIN_PATH) !== -1 || url.indexOf(DASHBOARD_PATH) !== -1;
-    if (namesItsOwnMetric && !skipped('join')) {
+    if (url.indexOf(DASHBOARD_PATH) !== -1 && !skipped('join')) {
+      if (body.indexOf('"' + SOURCE_METRIC + '"') === -1 || body.indexOf('"' + TARGET_METRIC + '"') !== -1) {
+        return nativeSend.apply(xhr, args);
+      }
+      return proxy(xhr, body, swapRequestedMetric, dashboardConverter);
+    }
+
+    if (url.indexOf(JOIN_PATH) !== -1 && !skipped('join')) {
       var ours = body.indexOf('"realview"') !== -1;
       var hasSource = body.indexOf('"' + SOURCE_METRIC + '"') !== -1;
       // A query that already asks for both metrics would end up with a

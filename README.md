@@ -81,13 +81,17 @@ On the channel this was built against the difference is real: over 365 days the 
   prefix. A table listing sources *and* their details together — "YouTube recommendations" with
   "YouTube Home" beneath it — is rebuilt from both levels at once, since the server answers each
   on its own but not the two together.
-- **View counts a card keeps for itself** — the retention curve reports a video's views
-  alongside its own figures rather than as a metric column, and that is converted too.
+- **View counts a card keeps for itself** — the retention curve reports a video's views alongside
+  its own figures rather than as a metric column, and the latest-video card reports each of its
+  metrics as a row naming the video once at the top. Both are converted.
 
-Not covered: cards that report their figures in some shape other than a table of metric columns
-— the **latest video performance** card is one. Rather than enumerate them, any card that
-mentions views and had nothing converted inside it is taken at its word, and the wording on that
-screen is left as Studio wrote it.
+Not covered: the **ranking** on the latest-video card — "6 of 10", and the band under it. Those
+are the server's comparison of the video against recent ones, and they only appear a few hours
+after publishing, so their shape has not been seen yet. The figures on that card are converted;
+the ranking is still the server's.
+
+More generally, any card that mentions views and had nothing converted inside it is taken at its
+word, and the wording on that screen is left as Studio wrote it.
 
 A screen is only relabelled once every figure on it has really been converted, so a raw count is
 never captioned as an engaged one. Two things are exempt: sparklines split by two dimensions at
@@ -108,7 +112,7 @@ technique for each:
 
 | Endpoint | What it serves | Technique |
 | --- | --- | --- |
-| `creator/get_channel_dashboard` | The channel dashboard | The request names the metric it wants, so it is asked for the engaged one and the answer renamed back |
+| `creator/get_channel_dashboard` | The channel dashboard | Both at once: the queries it names are asked for the engaged metric and renamed back, and the figures its cards keep for themselves are substituted |
 | `yta_web/join` | Queries Studio composes itself | Same |
 | `yta_web/get_screen` | Analytics screens, including the realtime card | The request names no metric and the server always answers raw, so the response is held and its figures are substituted |
 | `yta_web/get_cards` | Analytics card data | Same |

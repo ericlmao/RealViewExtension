@@ -526,11 +526,12 @@ test('the channel dashboard asks for the engaged metric and reads back its own',
   });
   const body = JSON.stringify({
     context: {},
-    dashboardParams: { facts: [{ query: { metrics: [{ type: 'EXTERNAL_VIEWS' }] } }] }
+    dashboardParams: { channelId: CHANNEL, facts: [{ query: { metrics: [{ type: 'EXTERNAL_VIEWS' }] } }] }
   });
   const result = await request(env, 'https://studio.youtube.com/youtubei/v1/creator/get_channel_dashboard?alt=json', body);
 
-  assert.ok(env.sent[0].body.includes('"ENGAGED_VIEWS"'), 'the dashboard query asks for engaged views');
+  const outgoing = env.sent.find((entry) => entry.url.includes('get_channel_dashboard'));
+  assert.ok(outgoing.body.includes('"ENGAGED_VIEWS"'), 'the dashboard query asks for engaged views');
   assert.ok(result.text.includes('"EXTERNAL_VIEWS"'), 'and the answer is renamed back for the caller');
   assert.ok(result.text.includes('47'), 'carrying the engaged figure');
   assert.strictEqual(env.attributes['data-realview-converted-dashboard'], 'yes');
@@ -1034,6 +1035,28 @@ test('a table listing sources with their details is rebuilt from both', async ()
   assert.deepStrictEqual(columns[0].counts.values, [60, 55, 5, 8], 'parents from the source figures, children from the detail ones');
   assert.deepStrictEqual(columns[1].percentages.values.map(Math.round), [47, 43, 4, 6], 'shares follow');
   assert.strictEqual(env.attributes['data-realview-converted-analytics'], 'yes', 'and the wording may be corrected');
+});
+
+test("the latest-video card's views row is converted", async () => {
+  const payload = JSON.parse(screenResponse());
+  payload.cards.push({ entitySnapshotCardData: {
+    video: { externalVideoId: 'vidA', videoFormat: 'VIDEO_FORMAT_VOD' },
+    metricsTable: { metricRows: [
+      { metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 149600 }, typicalRange: {} },
+      { metric: { type: 'AVERAGE_WATCH_TIME' }, value: { double: 476 }, typicalRange: {} }
+    ] }
+  } });
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'yta_web/join': joinResponder({ vidA: 11, vidB: 4 })
+  });
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const rows = JSON.parse(result.text).cards[3].entitySnapshotCardData.metricsTable.metricRows;
+
+  assert.strictEqual(rows[0].value.double, 11, 'the views row follows the metric');
+  assert.strictEqual(rows[1].value.double, 476, 'and the other rows are left alone');
+  assert.strictEqual(env.attributes['data-realview-converted-analytics'], 'yes', 'so the card no longer holds the wording back');
 });
 
 test('an unrelated request is not touched', async () => {

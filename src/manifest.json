@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "RealView - Engaged Views for YouTube Studio",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "description": "Reports Engaged Views (the old 30-second view metric) across YouTube Studio, in place of the raw view count, and paints the charts red.",
   "icons": {
     "16": "icons/icon16.png",
