@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>RealView</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      body {
+        width: 300px;
+        margin: 0;
+        padding: 16px;
+        font-family: "Roboto", system-ui, -apple-system, sans-serif;
+        font-size: 13px;
+        background: Canvas;
+        color: CanvasText;
+      }
+      h1 {
+        margin: 0 0 2px;
+        font-size: 15px;
+        font-weight: 600;
+      }
+      p.sub {
+        margin: 0 0 14px;
+        opacity: 0.65;
+        line-height: 1.4;
+      }
+      label.row {
+        display: flex;
+        align-items: flex-start;
+        gap: 10px;
+        padding: 9px 0;
+        cursor: pointer;
+        border-top: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+      }
+      label.row input {
+        margin: 2px 0 0;
+        accent-color: #c00;
+      }
+      .row-text strong {
+        display: block;
+        font-weight: 500;
+      }
+      .row-text span {
+        opacity: 0.65;
+        line-height: 1.35;
+      }
+      footer {
+        margin-top: 12px;
+        padding-top: 10px;
+        border-top: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+        opacity: 0.6;
+        line-height: 1.4;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>RealView</h1>
+    <p class="sub">Shows Engaged Views &mdash; the old 30-second view count &mdash; on the YouTube Studio analytics screens.</p>
+
+    <label class="row">
+      <input type="checkbox" id="rewrite" />
+      <span class="row-text">
+        <strong>Use engaged views</strong>
+        <span>Replaces the view figures across Studio with engaged views, and renames the cards to match.</span>
+      </span>
+    </label>
+
+    <label class="row">
+      <input type="checkbox" id="color" />
+      <span class="row-text">
+        <strong>Red charts</strong>
+        <span>Paints the analytics graphs red instead of the default blue.</span>
+      </span>
+    </label>
+
+    <label class="row">
+      <input type="checkbox" id="debug" />
+      <span class="row-text">
+        <strong>Log to the console</strong>
+        <span>Reports what was converted, and why a conversion was skipped.</span>
+      </span>
+    </label>
+
+    <footer id="status">Reload YouTube Studio after changing a setting.</footer>
+    <script src="popup.js"></script>
+  </body>
+</html>

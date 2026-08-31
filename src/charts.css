@@ -1,0 +1,60 @@
+/*
+ * RealView - paints Studio's analytics charts red while the extension is on.
+ *
+ * The charts are inline SVG whose colour lives in stroke and fill attributes,
+ * which any stylesheet rule overrides. Everything is scoped to the attribute
+ * the settings bridge writes, so turning the extension off restores Studio's
+ * own palette with no cleanup.
+ */
+
+html[data-realview-color="on"] path.line-series,
+html[data-realview-color="on"] path.line,
+html[data-realview-color="on"] .line-series path {
+  stroke: #ff0033 !important;
+}
+
+html[data-realview-color="on"] path.area,
+html[data-realview-color="on"] .area path {
+  fill: rgba(255, 0, 51, 0.12) !important;
+}
+
+html[data-realview-color="on"] path.bar,
+html[data-realview-color="on"] rect.bar,
+html[data-realview-color="on"] .bar path {
+  fill: #ff0033 !important;
+  stroke: #ff0033 !important;
+}
+
+html[data-realview-color="on"] circle.point,
+html[data-realview-color="on"] circle.dot,
+html[data-realview-color="on"] .point circle,
+html[data-realview-color="on"] .highlight circle {
+  fill: #ff0033 !important;
+  stroke: #ff0033 !important;
+}
+
+/* Sparklines and the small per-row charts in tables. */
+html[data-realview-color="on"] yta-tiny-chart path,
+html[data-realview-color="on"] yta-realtime-chart path.bar,
+html[data-realview-color="on"] yta-line-chart-base path.line-series {
+  stroke: #ff0033 !important;
+}
+
+html[data-realview-color="on"] yta-tiny-chart path.area,
+html[data-realview-color="on"] yta-realtime-chart path.bar {
+  fill: #ff0033 !important;
+}
+
+/* Anything still painted in Studio's default analytics blue. The charts set
+   their colour as a presentation attribute, which a stylesheet rule outranks. */
+html[data-realview-color="on"] [stroke="rgba(65, 180, 217, 1)"] {
+  stroke: #ff0033 !important;
+}
+
+html[data-realview-color="on"] [fill="rgba(65, 180, 217, 1)"] {
+  fill: #ff0033 !important;
+}
+
+html[data-realview-color="on"] [fill="rgba(65, 180, 217, 0.1)"] {
+  fill: rgba(255, 0, 51, 0.12) !important;
+}
