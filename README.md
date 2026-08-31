@@ -1,8 +1,59 @@
 # RealView
 
-A Chrome extension that makes YouTube Studio report **engaged views** — the old definition of a
-view — instead of the raw view count, across every surface that shows one. It also paints the
-analytics charts red.
+A Chrome extension that makes YouTube Studio show **engaged views** — the older definition of a
+view, counted after roughly 30 seconds of watching — everywhere it normally shows the newer Views
+figure. It also colours the analytics graphs red.
+
+---
+
+## Setup
+
+You need Google Chrome, version 111 or newer. That is any Chrome from the last couple of years.
+
+**1. Unzip the file.** Unzip `RealView-extension.zip`. You will get a folder called
+`RealView-extension`. Put it somewhere permanent, such as Documents. Chrome loads the extension
+from this folder every time it starts, so it must not be moved or deleted afterwards.
+
+**2. Open Chrome's extensions page.** Type `chrome://extensions` into the address bar and press
+Enter.
+
+**3. Turn on Developer mode.** The switch is in the top right corner of that page.
+
+**4. Click "Load unpacked".** The button appears in the top left once Developer mode is on.
+
+**5. Choose the folder.** Select the `RealView-extension` folder itself — not the zip file, and
+not a file inside it. RealView now appears in your list of extensions.
+
+**6. Check it worked.** Go to <https://studio.youtube.com> and open Analytics. The main card
+should read "Engaged views" instead of "Views", and the graph should be red.
+
+The number will be lower than the Views figure you saw before. That is expected, and is the whole
+point: it leaves out people who clicked away within the first few seconds.
+
+### Turning it on and off
+
+Click the RealView icon in the Chrome toolbar. You may need to click the puzzle-piece icon first
+and pin RealView to see it. The popup has three switches:
+
+- **Use engaged views** — the main switch. Turn it off and Studio behaves exactly as it normally
+  does.
+- **Red charts** — the graph colour, independent of the numbers.
+- **Log to the console** — for diagnosing a problem. Leave it off for normal use.
+
+### Things worth knowing
+
+- Chrome shows a "Disable developer mode extensions" warning each time it starts. That is normal
+  for any extension installed this way, and can be dismissed. RealView keeps working.
+- RealView only runs on studio.youtube.com and does nothing on any other site.
+- No data is sent anywhere. The extension asks YouTube's own analytics service for the engaged
+  figures using your existing signed-in session, and shows them in place of the raw ones. Nothing
+  leaves your browser and nothing is stored.
+- Your channel is not modified. This changes what Studio shows you; other people see nothing
+  different.
+- If a page ever looks wrong, switch **Use engaged views** off and reload. Studio returns to
+  normal immediately.
+
+---
 
 ## Why
 
@@ -13,11 +64,23 @@ analytics API under the name `ENGAGED_VIEWS`, but Studio leads with the new one 
 On the channel this was built against the difference is real: over 365 days the raw count was
 953 and the engaged count 938; over 28 days, 60 against 47; over 7 days, 24 against 11.
 
+## What it covers
+
+- **Analytics** — the headline metric card, its comparison figure and daily chart, the sentence
+  above the cards, and every table's view column. Channel, video and playlist scopes.
+- **Realtime** — the 48-hour card, including its hourly chart and its top-videos table, queried
+  over exactly the hours the card draws.
+- **Channel dashboard** — the summary card and top content.
+- **Content tab** — the video list's lifetime view counts.
+
+`relabel.js` corrects the wording on the analytics screens, the dashboard and the video list —
+and only once the interceptor confirms the numbers on that surface really changed.
+
 ## How it works
 
-Studio's data comes from `https://studio.youtube.com/youtubei/v1/`, over `XMLHttpRequest`. Three
-endpoints matter, and they expose the metric to the client to different degrees, so RealView
-uses a different technique for each:
+Studio's data comes from `https://studio.youtube.com/youtubei/v1/`, over `XMLHttpRequest`. The
+endpoints expose the metric to the client to different degrees, so RealView uses a different
+technique for each:
 
 | Endpoint | What it serves | Technique |
 | --- | --- | --- |
@@ -80,23 +143,10 @@ that could go wrong is closed off:
 
 - Anything unexpected thrown inside the extension is caught, and the request goes out untouched
   rather than throwing into Studio's networking code.
-- A retargeted request the server refuses is retried once, exactly as Studio wrote it.
-- Two watchdogs guarantee an answer: one if the conversion never finishes, one covering the
-  whole exchange. A screen cannot end up waiting on this extension.
+- Two watchdogs guarantee an answer: one if the conversion never finishes, one covering the whole
+  exchange. A screen cannot end up waiting on this extension.
 - After two faults of the extension's own making, it stands down for the rest of the page and
   Studio serves its own figures. A systematic problem costs the engaged numbers, never the page.
-
-## What it covers
-
-- **Analytics** — the headline metric card, its comparison figure and daily chart, the sentence
-  above the cards, and every table's view column. Channel, video and playlist scopes.
-- **Realtime** — the 48-hour card, including its hourly chart and its top-videos table, queried
-  over exactly the hours the card draws.
-- **Channel dashboard** — the summary card and top content.
-- **Content tab** — the video list's lifetime view counts.
-
-`relabel.js` corrects the wording on the analytics screens, the dashboard and the video list —
-and only once the interceptor confirms the numbers on that surface really changed.
 
 ## Red charts
 
@@ -106,38 +156,31 @@ attribute value, so it catches the line series, the area fill, the realtime bars
 else painted in the default accent colour. Everything is scoped to an attribute the settings
 bridge writes, so turning the option off restores Studio's palette with no cleanup.
 
-## Troubleshooting
+## Diagnosing a problem
 
-Turn on **Log to the console** in the popup; each converted response reports what it changed and
+Turn on **Log to the console** in the popup; each converted response reports what it changed, and
 any fault reports why it gave up.
 
-There is also a diagnostic switch for narrowing a problem down to one surface. In the console on
-any Studio page:
+There is also a switch for narrowing a problem down to one surface. In the console on any Studio
+page:
 
     chrome.storage.sync.set({ skip: 'screen,cards,videos,join' })
 
 Any subset of those names is left entirely alone until you set it back to `''`.
-
-## Install
-
-1. Open `chrome://extensions`.
-2. Turn on **Developer mode** (top right).
-3. Click **Load unpacked** and choose this repository's `src` directory, or the
-   `RealView-extension` folder in Downloads if you are using the packaged build.
-4. Open <https://studio.youtube.com>.
-
-Chrome 111 or newer is required, because the interceptor is declared with `"world": "MAIN"`.
 
 ## Files
 
 | File | Runs in | Purpose |
 | --- | --- | --- |
 | `manifest.json` | — | Manifest V3 declaration |
-| `interceptor.js` | page context | Retargets, swaps and substitutes the view figures |
+| `interceptor.js` | page context | Swaps and substitutes the view figures |
 | `bridge.js` | isolated world | Mirrors saved settings onto `<html>` |
 | `relabel.js` | isolated world | Corrects the wording Studio writes itself |
 | `charts.css` | isolated world | Paints the charts red |
 | `popup.html` / `popup.js` | popup | Three switches, stored in `chrome.storage.sync` |
+
+Developers can point **Load unpacked** at this repository's `src` directory instead of the
+packaged folder.
 
 ## Tests
 
@@ -147,5 +190,5 @@ Chrome 111 or newer is required, because the interceptor is declared with `"worl
 carrying the settings, an event target — and loads `src/interceptor.js` into it unmodified. The
 suite covers each conversion technique, the parallel query, the cache, the four-second deadline,
 a failing query, an error from Studio, the disabled state, the exact event sequence a rewritten
-response is delivered with, a refused request being retried, an exception inside the extension,
-and the fault limit standing the extension down.
+response is delivered with, an exception inside the extension, and the fault limit standing the
+extension down.
