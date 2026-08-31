@@ -37,7 +37,8 @@ and pin RealView to see it. The popup has three switches:
 
 - **Use engaged views** — the main switch. Turn it off and Studio behaves exactly as it normally
   does.
-- **Red charts** — the graph colour, independent of the numbers.
+- **Red charts** — the graph colour. It only applies while engaged views are being shown; with
+  the switch above turned off the graphs go back to YouTube's own blue.
 - **Log to the console** — for diagnosing a problem. Leave it off for normal use.
 
 ### Things worth knowing
@@ -149,6 +150,10 @@ that could go wrong is closed off:
   Studio serves its own figures. A systematic problem costs the engaged numbers, never the page.
 
 ## Red charts
+
+The red is a signal that a figure is an engaged view rather than Studio's own, so it is tied to
+the conversion: turning engaged views off puts the graphs back to YouTube's blue whatever the
+colour switch says, and the popup dims that switch to show it no longer applies.
 
 Studio draws its charts as inline SVG with the colour written into `stroke` and `fill`
 attributes, which a stylesheet rule outranks. `charts.css` recolours them by class and by

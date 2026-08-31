@@ -14,8 +14,12 @@
   function apply(settings) {
     var root = document.documentElement;
     if (!root) return;
-    root.setAttribute('data-realview-rewrite', settings.rewrite === false ? 'off' : 'on');
-    root.setAttribute('data-realview-color', settings.color === false ? 'off' : 'on');
+    var converting = settings.rewrite !== false;
+    // The red charts mark figures that are engaged views. With the conversion
+    // switched off the figures are Studio's own, so they keep Studio's colour.
+    var red = converting && settings.color !== false;
+    root.setAttribute('data-realview-rewrite', converting ? 'on' : 'off');
+    root.setAttribute('data-realview-color', red ? 'on' : 'off');
     root.setAttribute('data-realview-debug', settings.debug === true ? 'on' : 'off');
     root.setAttribute('data-realview-skip', settings.skip || '');
   }
