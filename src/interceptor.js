@@ -268,14 +268,13 @@
     // A dimension arrives as text for entities, as date ids for a daily series
     // and as timestamps for an hourly one. Rows only cover buckets that have
     // data, so results are matched by label rather than by position.
-    var labels = null;
-    if (dimension) {
-      if (dimension.strings) labels = dimension.strings.values;
-      else if (dimension.dateIds) labels = dimension.dateIds.values;
-      else if (dimension.timestamps) labels = dimension.timestamps.values;
-      else if (dimension.enumValues) labels = dimension.enumValues.values;
-    }
-    return { values: values, labels: labels };
+    var labels = dimension ? columnLabels(dimension) : null;
+
+    var columns = (table.dimensionColumns || []).map(function (each) {
+      return { type: each.dimension && each.dimension.type, labels: columnLabels(each) || [] };
+    });
+
+    return { values: values, labels: labels, columns: columns };
   }
 
   // Sends every query a surface needs as one request, and remembers each one by
@@ -402,12 +401,17 @@
     // The realtime card covers the last 48 hours rather than the screen's
     // period, and the video table inside it covers those same hours, so a table
     // is tagged with the card it belongs to.
-    function walk(node, depth, realtime) {
+    function walk(node, depth, realtime, contentType) {
       if (depth > 14 || node === null || typeof node !== 'object') return;
       if (Array.isArray(node)) {
-        for (var i = 0; i < node.length; i++) walk(node[i], depth + 1, realtime);
+        for (var i = 0; i < node.length; i++) walk(node[i], depth + 1, realtime, contentType);
         return;
       }
+
+      // A card can repeat the same breakdown for each kind of content, one
+      // table per tab, and names the kind alongside the table rather than
+      // inside it.
+      if (typeof node.contentType === 'string') contentType = node.contentType;
       if (node.metric === SOURCE_METRIC && typeof node.total === 'number') headline.push(node);
 
       // Some cards carry a plain view count for a video alongside their own
@@ -451,17 +455,17 @@
         for (var c = 0; c < node.metricColumns.length; c++) {
           var column = node.metricColumns[c];
           if (column && column.metric && column.metric.type === SOURCE_METRIC && (column.counts || column.percentages)) {
-            tables.push({ table: node, column: column, realtime: realtime });
+            tables.push({ table: node, column: column, realtime: realtime, contentType: contentType });
           }
         }
       }
       var keys = Object.keys(node);
       for (var k = 0; k < keys.length; k++) {
-        walk(node[keys[k]], depth + 1, realtime || keys[k] === 'latestActivityCardData');
+        walk(node[keys[k]], depth + 1, realtime || keys[k] === 'latestActivityCardData', contentType);
       }
     }
 
-    walk(payload, 0, false);
+    walk(payload, 0, false, null);
     return { headline: headline, tables: tables, headers: headers, entities: entities, rankings: rankings };
   }
 
@@ -501,10 +505,83 @@
     return { types: types, details: details };
   }
 
+  // The server answers a query split by more than one dimension for most
+  // pairings, so a table like age against gender can be rebuilt by matching
+  // each row on the whole set of names that identify it. Two exceptions stand:
+  // a run of time buckets split by something else is a sparkline, too large and
+  // pointless to rebuild, and traffic sources against their details are refused
+  // outright, which the hierarchy path handles instead.
+  function tableDimensions(table) {
+    var columns = table.dimensionColumns;
+    if (!columns || !columns.length) return null;
+
+    var described = [];
+    for (var i = 0; i < columns.length; i++) {
+      var column = columns[i];
+      if (!column || !column.dimension || !column.dimension.type) return null;
+      var labels = columnLabels(column);
+      if (!labels || !labels.length) return null;
+      described.push({ type: column.dimension.type, labels: labels, time: !!(column.timestamps || column.dateIds) });
+    }
+
+    if (described.length > 1 && described.some(function (d) { return d.time; })) return null;
+    return described;
+  }
+
+  // Row keys join every name that identifies the row, so a two-way table maps
+  // by the pair rather than by either half.
+  function rowKeys(described) {
+    var count = described[0].labels.length;
+    var keys = [];
+    for (var row = 0; row < count; row++) {
+      var parts = [];
+      for (var d = 0; d < described.length; d++) parts.push(String(described[d].labels[row]));
+      keys.push(parts.join('\u0000'));
+    }
+    return keys;
+  }
+
+  function answerKeys(table, described) {
+    if (!table.columns) return null;
+    var ordered = [];
+    for (var d = 0; d < described.length; d++) {
+      var match = null;
+      for (var c = 0; c < table.columns.length; c++) if (table.columns[c].type === described[d].type) match = table.columns[c];
+      if (!match) return null;
+      ordered.push(match.labels);
+    }
+    var keys = [];
+    for (var row = 0; row < ordered[0].length; row++) {
+      var parts = [];
+      for (var i = 0; i < ordered.length; i++) parts.push(String(ordered[i][row]));
+      keys.push(parts.join('\u0000'));
+    }
+    return keys;
+  }
+
+  // Each tab of a by-content-type card is a table of its own, and the figures
+  // behind it cover that kind of content alone. The query names the kind the
+  // way the analytics backend does, which is not the way the card does.
+  var CONTENT_TYPE_VALUES = {
+    CONTENT_ANALYSIS_TYPE_ALL_CONTENT: null,
+    CONTENT_ANALYSIS_TYPE_VIDEO: 'VIDEO_ON_DEMAND',
+    CONTENT_ANALYSIS_TYPE_SHORTS: 'SHORTS',
+    CONTENT_ANALYSIS_TYPE_LIVE_STREAMS: 'LIVE_STREAM'
+  };
+
+  // Returns the restricts a table's query needs, or null for a kind of content
+  // this does not know how to ask about - a podcast tab, say - in which case
+  // the table is left raw rather than filled with the whole channel's figures.
+  function contentTypeRestricts(ctx, entry) {
+    if (!entry.contentType) return ctx.restricts;
+    if (!Object.prototype.hasOwnProperty.call(CONTENT_TYPE_VALUES, entry.contentType)) return null;
+    var value = CONTENT_TYPE_VALUES[entry.contentType];
+    if (!value) return ctx.restricts;
+    return ctx.restricts.concat([{ dimension: { type: 'CREATOR_CONTENT_TYPE' }, inValues: [value] }]);
+  }
+
   function tableDimension(table) {
     var columns = table.dimensionColumns;
-    // A table broken down by two dimensions at once, such as views per hour per
-    // video, cannot be rebuilt from a one-dimensional answer, so it is skipped.
     if (!columns || columns.length !== 1) return null;
     var column = columns[0];
     if (!column || !column.dimension) return null;
@@ -637,6 +714,9 @@
     });
 
     found.tables.forEach(function (entry, index) {
+      var scoped = contentTypeRestricts(ctx, entry);
+      if (!scoped) { log('left raw: a', entry.contentType, 'table, which cannot be asked for'); return; }
+
       var hierarchy = sourceHierarchy(entry.table);
       if (hierarchy) {
         var pairRange = entry.realtime ? hourlyRange : (ctx.range || hourlyRange);
@@ -645,7 +725,7 @@
         var typeKey = 'rv_pairs_' + index + '_type';
         nodes.push({
           key: typeKey,
-          value: { query: buildQuery({ dimensions: [{ type: 'TRAFFIC_SOURCE_TYPE' }], range: pairRange, restricts: ctx.restricts, currency: ctx.currency }) }
+          value: { query: buildQuery({ dimensions: [{ type: 'TRAFFIC_SOURCE_TYPE' }], range: pairRange, restricts: scoped, currency: ctx.currency }) }
         });
 
         var prefixes = {};
@@ -662,7 +742,7 @@
               query: buildQuery({
                 dimensions: [{ type: 'TRAFFIC_SOURCE_DETAIL' }],
                 range: pairRange,
-                restricts: ctx.restricts.concat([{ dimension: { type: 'TRAFFIC_SOURCE_TYPE' }, inValues: [prefix] }]),
+                restricts: scoped.concat([{ dimension: { type: 'TRAFFIC_SOURCE_TYPE' }, inValues: [prefix] }]),
                 currency: ctx.currency,
                 limit: Math.max(hierarchy.details.length, 25)
               })
@@ -672,6 +752,36 @@
         });
 
         plans.push({ kind: 'pairs', entry: entry, hierarchy: hierarchy, typeKey: typeKey, detailKeys: detailKeys });
+        return;
+      }
+
+      var described = tableDimensions(entry.table);
+      if (described && described.length > 1) {
+        var wideRange = entry.realtime ? hourlyRange : (ctx.range || hourlyRange);
+        if (!wideRange) return;
+        // A two-way table has as many rows as the pairings that occurred, so
+        // the page has to be asked for large enough to hold all of them.
+        var wideRestricts = scoped.slice();
+        described.forEach(function (d) {
+          if (d.type === 'VIDEO' || d.type === 'PLAYLIST') {
+            wideRestricts = wideRestricts.concat([{ dimension: { type: d.type }, inValues: d.labels }]);
+          }
+        });
+
+        var wideKey = 'rv_wide_' + index;
+        nodes.push({
+          key: wideKey,
+          value: {
+            query: buildQuery({
+              dimensions: described.map(function (d) { return { type: d.type }; }),
+              range: wideRange,
+              restricts: wideRestricts,
+              currency: ctx.currency,
+              limit: Math.max(described[0].labels.length, 50)
+            })
+          }
+        });
+        plans.push({ kind: 'wide', entry: entry, described: described, keys: [wideKey] });
         return;
       }
 
@@ -686,7 +796,7 @@
       if (dimension.timestamps && dimension.labels.length) range = timestampRange(dimension.labels);
       if (!range) return;
 
-      var restricts = ctx.restricts.slice();
+      var restricts = scoped.slice();
       var isEntityDimension = dimension.type === 'VIDEO' || dimension.type === 'PLAYLIST';
       if (isEntityDimension) restricts = restricts.concat([{ dimension: { type: dimension.type }, inValues: dimension.labels }]);
 
@@ -1005,6 +1115,34 @@
         (item.entry.table.metricColumns || []).forEach(function (column) {
           if (!column.percentages || !column.metric || column.metric.type !== SOURCE_METRIC) return;
           column.percentages.values = pairValues.map(function (value) { return pairTotal ? (value / pairTotal) * 100 : 0; });
+        });
+
+        converted.push(item.entry.column);
+        tablesConverted++;
+        changed = true;
+      }
+
+      if (item.kind === 'wide') {
+        tablesFound++;
+        var wide = results[item.keys[0]];
+        if (!wide) { log('no answer for the', item.described.map(function (d) { return d.type; }).join(' by '), 'table'); return; }
+
+        var wanted = rowKeys(item.described);
+        var answered = wide.labels ? answerKeys(wide, item.described) : [];
+        if (wide.labels && !answered) { log('could not line up the', item.described.map(function (d) { return d.type; }).join(' by '), 'table'); return; }
+
+        var byRow = {};
+        for (var w = 0; w < answered.length; w++) byRow[answered[w]] = Number(wide.values[w]);
+
+        var wideValues = wanted.map(function (key) {
+          return Object.prototype.hasOwnProperty.call(byRow, key) ? byRow[key] : 0;
+        });
+        var wideTotal = wideValues.reduce(function (a, b) { return a + b; }, 0);
+
+        if (item.entry.column.counts) item.entry.column.counts.values = wideValues;
+        (item.entry.table.metricColumns || []).forEach(function (column) {
+          if (!column.percentages || !column.metric || column.metric.type !== SOURCE_METRIC) return;
+          column.percentages.values = wideValues.map(function (value) { return wideTotal ? (value / wideTotal) * 100 : 0; });
         });
 
         converted.push(item.entry.column);

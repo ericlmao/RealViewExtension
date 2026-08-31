@@ -1155,6 +1155,112 @@ test('a ranking is left alone when a video cannot be dated', async () => {
   assert.deepStrictEqual(entities.map((e) => e.rank), [1, 2], 'order untouched');
 });
 
+test('a table split by two dimensions is matched on the pair', async () => {
+  // Age against gender: each row is identified by both names, so the answer has
+  // to be lined up on the pair rather than on either half.
+  const payload = { cards: [{ tableCardData: { mainTableData: {
+    dimensionColumns: [
+      { dimension: { type: 'VIEWER_AGE' }, enumValues: { values: ['AGE_18_24', 'AGE_18_24', 'AGE_25_34'] } },
+      { dimension: { type: 'VIEWER_GENDER' }, enumValues: { values: ['GENDER_FEMALE', 'GENDER_MALE', 'GENDER_MALE'] } }
+    ],
+    metricColumns: [
+      { metric: { type: 'EXTERNAL_VIEWS' }, counts: { values: [10, 20, 70] } },
+      { metric: { type: 'EXTERNAL_VIEWS', asPercentagesOfTotal: true }, percentages: { values: [10, 20, 70] } }
+    ]
+  } } }] };
+
+  let asked = null;
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'yta_web/join': (body) => {
+      const node = JSON.parse(body).nodes[0];
+      asked = node.value.query.dimensions.map((d) => d.type);
+      return { status: 200, text: JSON.stringify({ results: [{ key: node.key, value: { resultTable: {
+        // Deliberately a different row order, and the columns the other way round.
+        dimensionColumns: [
+          { dimension: { type: 'VIEWER_GENDER' }, enumValues: { values: ['GENDER_MALE', 'GENDER_MALE', 'GENDER_FEMALE'] } },
+          { dimension: { type: 'VIEWER_AGE' }, enumValues: { values: ['AGE_25_34', 'AGE_18_24', 'AGE_18_24'] } }
+        ],
+        metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: [30, 5, 15] } }]
+      } } }] }) };
+    }
+  });
+
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const columns = JSON.parse(result.text).cards[0].tableCardData.mainTableData.metricColumns;
+
+  assert.deepStrictEqual(asked, ['VIEWER_AGE', 'VIEWER_GENDER'], 'asked for both dimensions at once');
+  assert.deepStrictEqual(columns[0].counts.values, [15, 5, 30], 'each row took the figure for its own pair');
+  assert.deepStrictEqual(columns[1].percentages.values, [30, 10, 60], 'and the shares follow');
+});
+
+test('each tab of a by-content-type card is asked for its own kind of content', async () => {
+  // One breakdown repeated per content type: the tables are identical apart
+  // from the kind of content they cover, so each needs its own query.
+  const table = () => ({ tableCard: { mainTableData: {
+    dimensionColumns: [{ dimension: { type: 'COUNTRY' }, strings: { values: ['CA', 'US'] } }],
+    metricColumns: [{ metric: { type: 'EXTERNAL_VIEWS' }, counts: { values: [10, 20] } }]
+  } } });
+  const payload = { cards: [{ tableCardByContentTypeCardData: { tables: [
+    Object.assign({ contentType: 'CONTENT_ANALYSIS_TYPE_ALL_CONTENT' }, table()),
+    Object.assign({ contentType: 'CONTENT_ANALYSIS_TYPE_VIDEO' }, table()),
+    Object.assign({ contentType: 'CONTENT_ANALYSIS_TYPE_SHORTS' }, table()),
+    Object.assign({ contentType: 'CONTENT_ANALYSIS_TYPE_PODCASTS' }, table())
+  ] } }] };
+
+  // Each kind of content answers with a figure of its own, so a table filled
+  // from the wrong query is visible in the result.
+  const byKind = { none: [1, 2], VIDEO_ON_DEMAND: [3, 4], SHORTS: [5, 6] };
+  const asked = [];
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'yta_web/join': (body) => {
+      const results = JSON.parse(body).nodes.map((node) => {
+        const restrict = node.value.query.restricts.find((r) => r.dimension.type === 'CREATOR_CONTENT_TYPE');
+        const kind = restrict ? restrict.inValues[0] : 'none';
+        if ((node.value.query.dimensions[0] || {}).type === 'COUNTRY') asked.push(kind);
+        return { key: node.key, value: { resultTable: {
+          dimensionColumns: [{ dimension: { type: 'COUNTRY' }, strings: { values: ['CA', 'US'] } }],
+          metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: byKind[kind] } }]
+        } } };
+      });
+      return { status: 200, text: JSON.stringify({ results }) };
+    }
+  });
+
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const tables = JSON.parse(result.text).cards[0].tableCardByContentTypeCardData.tables;
+
+  assert.deepStrictEqual(asked.sort(), ['SHORTS', 'VIDEO_ON_DEMAND', 'none'], 'one query per kind, and none for the podcast tab');
+  assert.deepStrictEqual(tables[0].tableCard.mainTableData.metricColumns[0].counts.values, [1, 2], 'all content');
+  assert.deepStrictEqual(tables[1].tableCard.mainTableData.metricColumns[0].counts.values, [3, 4], 'videos only');
+  assert.deepStrictEqual(tables[2].tableCard.mainTableData.metricColumns[0].counts.values, [5, 6], 'shorts only');
+  assert.deepStrictEqual(tables[3].tableCard.mainTableData.metricColumns[0].counts.values, [10, 20], 'the podcast tab is left as it was');
+  assert.strictEqual(env.attributes['data-realview-converted-analytics'], 'no',
+    'and the screen is not relabelled while a raw table remains');
+});
+
+test('a sparkline over time is still left alone', async () => {
+  const payload = { cards: [{ latestActivityCardData: { datas: [{ sparkChartData: {
+    dimensionColumns: [
+      { dimension: { type: 'HOUR' }, timestamps: { values: [Date.now() - 3600000, Date.now()] } },
+      { dimension: { type: 'VIDEO' }, strings: { values: ['vidA', 'vidB'] } }
+    ],
+    metricColumns: [{ metric: { type: 'EXTERNAL_VIEWS' }, counts: { values: [3, 4] } }]
+  } }] } }] };
+
+  const asked = [];
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'yta_web/join': (body) => { JSON.parse(body).nodes.forEach((n) => asked.push(n.value.query.dimensions.map((d) => d.type).join('+'))); return joinResponder()(body); }
+  });
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+
+  assert.ok(!asked.includes('HOUR+VIDEO'), 'no query for the sparkline pairing');
+  const column = JSON.parse(result.text).cards[0].latestActivityCardData.datas[0].sparkChartData.metricColumns[0];
+  assert.deepStrictEqual(column.counts.values, [3, 4], 'left as it was');
+});
+
 test('an unrelated request is not touched', async () => {
   const env = createEnvironment({ 'creator/get_creator_channels': '{"channels":[]}' });
   const result = await request(env, 'https://studio.youtube.com/youtubei/v1/creator/get_creator_channels?alt=json', '{}');

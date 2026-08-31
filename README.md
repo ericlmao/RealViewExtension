@@ -73,9 +73,14 @@ On the channel this was built against the difference is real: over 365 days the 
   over exactly the hours the card draws.
 - **Channel dashboard** — the summary card and top content.
 - **Content tab** — the video list's lifetime view counts.
-- **Traffic sources, countries, devices and the rest** — the tables that break views down by
-  something, including the ones that report only each row's share rather than the views
-  themselves; those shares are worked out again from the converted figures. Traffic *detail*
+- **Traffic sources, countries, devices, age against gender and the rest** — the tables that break
+  views down by something, one dimension or two, including the ones that report only each row's
+  share rather than the views themselves; those shares are worked out again from the converted
+  figures. A table split two ways is asked for split the same way, and each row takes the figure
+  for its own pair of names. A card that repeats the same breakdown once per kind of content -
+  the All, Videos, Shorts and Live tabs - is asked about one kind at a time, so the Shorts tab
+  gets the Shorts figures rather than the channel's. A kind RealView cannot name to the query
+  endpoint, such as podcasts, is left raw rather than filled with the whole channel's numbers. Traffic *detail*
   rows — a search term, a linking site — are asked for one kind of source at a time, since the
   server refuses a query that does not say which kind it means; the row names carry that as a
   prefix. A table listing sources *and* their details together — "YouTube recommendations" with
@@ -96,9 +101,9 @@ Any card that mentions views and had nothing converted inside it is taken at its
 wording on that screen is left as Studio wrote it.
 
 A screen is only relabelled once every figure on it has really been converted, so a raw count is
-never captioned as an engaged one. Two things are exempt: sparklines split by two dimensions at
-once, which cannot be converted and carry no caption, and the "views are counted differently now"
-notices, which name the metric without reporting any figure.
+never captioned as an engaged one. Two things are exempt: sparklines - a run of time buckets split
+by something else - which carry no caption and are not worth rebuilding, and the "views are counted
+differently now" notices, which name the metric without reporting any figure.
 
 Because a card can arrive after the screen it belongs to, that verdict can be withdrawn: a later
 response that leaves figures raw puts Studio's own wording back.
@@ -204,8 +209,9 @@ show engaged views while displaying raw ones. RealView never does this:
 - The daily chart is dropped rather than left drawn from raw views under an engaged label.
 - The "views are counted differently now" notice is removed from converted cards, since it
   describes a metric they are no longer showing.
-- A table broken down by two dimensions at once cannot be rebuilt from a one-dimensional answer,
-  so it is left alone rather than half-converted.
+- A table broken down by two dimensions is rebuilt from an answer split the same way, matched on
+  the pair of names that identifies each row. If the answer cannot be lined up, the table is left
+  alone rather than half-converted.
 - An error from Studio itself is relayed exactly as it arrived, so Studio's own retry and error
   handling behave as they would without the extension.
 
