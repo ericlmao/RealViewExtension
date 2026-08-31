@@ -168,6 +168,10 @@
     return dayRange(todayStart - days * DAY_MS, todayStart, offsetSecs);
   }
 
+  function lifetimeRange() {
+    return { kind: 'days', inclusiveStart: 20050101, exclusiveEnd: toDateId(Date.now() + DAY_MS, 0) };
+  }
+
   function startOfToday(offsetSecs) {
     return Math.floor((Date.now() + offsetSecs * 1000) / DAY_MS) * DAY_MS - offsetSecs * 1000;
   }
@@ -393,6 +397,7 @@
     var tables = [];
     var headers = [];
     var entities = [];
+    var rankings = [];
 
     // The realtime card covers the last 48 hours rather than the screen's
     // period, and the video table inside it covers those same hours, so a table
@@ -413,6 +418,17 @@
           apply: (function (totals) { return function (value) { totals.views = value; }; })(node.metricTotals),
           holder: node.metricTotals
         });
+      }
+
+      // The latest-video card ranks the video against recent uploads, each
+      // entry naming a video and its figure over the same span since publishing.
+      if (node.ranking && Array.isArray(node.ranking.entities) && node.ranking.entities.length) {
+        var ranked = node.ranking.entities.filter(function (item) {
+          return item && item.entity && typeof item.entity.videoId === 'string' &&
+            item.metric && item.metric.type === SOURCE_METRIC &&
+            item.value && typeof item.value.double === 'number';
+        });
+        if (ranked.length === node.ranking.entities.length) rankings.push(node.ranking);
       }
 
       // The latest-video card reports each of its metrics as a row of its own,
@@ -446,7 +462,7 @@
     }
 
     walk(payload, 0, false);
-    return { headline: headline, tables: tables, headers: headers, entities: entities };
+    return { headline: headline, tables: tables, headers: headers, entities: entities, rankings: rankings };
   }
 
   // The gap between the first two buckets gives the granularity, so an hourly
@@ -714,9 +730,9 @@
     });
 
     if (found.entities.length) {
-      // A card can carry these figures without the screen stating a period -
-      // the retention curve counts a video's whole life - so fall back to that.
-      var entityRange = ctx.range || { kind: 'days', inclusiveStart: 20050101, exclusiveEnd: toDateId(Date.now() + DAY_MS, 0) };
+      // These cards count a video's whole life rather than the screen's period,
+      // so they are asked for over that regardless of what the screen selected.
+      var entityRange = lifetimeRange();
       var ids = found.entities.map(function (entity) { return entity.videoId; });
       var entityKey = 'rv_entities';
       nodes.push({
@@ -831,7 +847,7 @@
             if (!column || !column.metric || column.metric.type !== SOURCE_METRIC) continue;
             if (!column.counts && !column.percentages) continue;
             if (converted.indexOf(column) === -1) {
-              log('left raw:', (dimensions && dimensions[0] && dimensions[0].dimension && dimensions[0].dimension.type) || 'a table with no dimension', 'rows', rows ? rows.length : 0);
+              log('left raw:', (dimensions && dimensions[0] && dimensions[0].dimension && dimensions[0].dimension.type) || 'a table with no dimension');
               left = true;
               return;
             }
@@ -886,7 +902,7 @@
     var changed = false;
     var tablesFound = 0;
     var tablesConverted = 0;
-    var converted = [];
+    var converted = (ctx.preConverted || []).slice();
 
     plan.plans.forEach(function (item) {
       if (item.kind === 'headline') {
@@ -1059,13 +1075,137 @@
 
   function convertAnalytics(payload, ctx) {
     var plan = planConversion(payload, ctx);
-    if (plan.nodes.length === 0) return Promise.resolve(false);
+    if (plan.nodes.length === 0 && plan.found.rankings.length === 0) return Promise.resolve(false);
 
-    return runQueries(ctx, plan.nodes).then(function (results) {
-      var changed = applyConversion(plan, results, ctx);
+    var rankings = Promise.all(plan.found.rankings.map(function (ranking) {
+      return convertRanking(ranking, ctx);
+    }));
+
+    return Promise.all([runQueries(ctx, plan.nodes), rankings]).then(function (both) {
+      var results = both[0];
+      var rankingChanged = both[1].some(Boolean);
+      var changed = applyConversion(plan, results, ctx) || rankingChanged;
       if (changed) renameTabConfigs(payload);
       log('analytics converted', { headlines: plan.found.headline.length, tables: plan.found.tables.length, changed: changed });
       return changed;
+    });
+  }
+
+  /* --------------------------------------------- the latest-video ranking */
+
+  var VIDEO_LIST_REQUEST_PATH = '/youtubei/v1/creator/list_creator_videos';
+  var RANKING_LOOKUP_SIZE = 50;
+
+  // The ranking compares each video over the same stretch of its own life, so
+  // every entry needs the moment its video went up. Studio's own video list
+  // carries that, asked for with a mask narrow enough to keep the reply small.
+  function fetchPublishTimes(ctx, ids) {
+    if (!ctx.channelId) return Promise.resolve(null);
+
+    var body = {
+      filter: { and: { operands: [{ channelIdIs: { value: ctx.channelId } }] } },
+      order: 'VIDEO_ORDER_DISPLAY_TIME_DESC',
+      pageSize: RANKING_LOOKUP_SIZE,
+      mask: { videoId: true, timePublishedSeconds: true },
+      context: ctx.context
+    };
+
+    return new Promise(function (resolve) {
+      var settled = false;
+      function finish(value) { if (!settled) { settled = true; resolve(value); } }
+      var timer = setTimeout(function () { log('gave up waiting on the video list'); finish(null); }, QUERY_BUDGET_BASE_MS);
+
+      var xhr = new XMLHttpRequest();
+      nativeOpen.call(xhr, 'POST', location.origin + VIDEO_LIST_REQUEST_PATH + '?alt=json', true);
+      Object.keys(ctx.headers).forEach(function (name) {
+        try { nativeSetRequestHeader.call(xhr, name, ctx.headers[name]); } catch (e) {}
+      });
+      xhr.withCredentials = true;
+      xhr.onload = function () {
+        clearTimeout(timer);
+        if (xhr.status !== 200) { log('video list lookup returned', xhr.status); finish(null); return; }
+        try {
+          var parsed = JSON.parse(xhr.responseText);
+          var times = {};
+          (parsed.videos || []).forEach(function (video) {
+            if (video && video.videoId && video.timePublishedSeconds) {
+              times[video.videoId] = Number(video.timePublishedSeconds) * 1000;
+            }
+          });
+          finish(times);
+        } catch (e) { finish(null); }
+      };
+      xhr.onerror = function () { clearTimeout(timer); finish(null); };
+      nativeSend.call(xhr, JSON.stringify(body));
+    });
+  }
+
+  // Competition ranking, which is what Studio does: a figure's place is one
+  // more than the number of figures above it, so equal figures share a place.
+  function placeOf(value, values) {
+    var above = 0;
+    for (var i = 0; i < values.length; i++) if (values[i] > value) above++;
+    return above + 1;
+  }
+
+  function convertRanking(ranking, ctx) {
+    var ids = ranking.entities.map(function (item) { return item.entity.videoId; });
+
+    return fetchPublishTimes(ctx, ids).then(function (times) {
+      if (!times) return false;
+
+      // Every video has to be datable, or the list would mix spans and the
+      // order would mean nothing.
+      var missing = ids.filter(function (id) { return !times[id]; });
+      if (missing.length) { log('ranking left alone,', missing.length, 'videos without a publish time'); return false; }
+
+      // The list covers the newest video's life so far, measured from each
+      // video's own start. Whole hours, because the hourly figures are only
+      // accepted on hour boundaries.
+      var newest = Math.max.apply(null, ids.map(function (id) { return times[id]; }));
+      var span = Math.ceil((Date.now() - newest) / HOUR_MS) * HOUR_MS;
+      if (span <= 0) return false;
+
+      var nodes = ids.map(function (id, index) {
+        var start = Math.floor(times[id] / HOUR_MS) * HOUR_MS;
+        return {
+          key: 'rv_rank_' + index,
+          value: {
+            query: buildQuery({
+              dimensions: [{ type: 'VIDEO' }],
+              range: { kind: 'hours', startMs: start, endMs: start + span },
+              restricts: ctx.restricts.concat([{ dimension: { type: 'VIDEO' }, inValues: [id] }]),
+              currency: ctx.currency,
+              limit: 1
+            })
+          }
+        };
+      });
+
+      return runQueries(ctx, nodes).then(function (results) {
+        var figures = ids.map(function (id, index) {
+          var table = results['rv_rank_' + index];
+          if (!table) return null;
+          if (!table.labels) return 0;
+          for (var i = 0; i < table.labels.length; i++) if (String(table.labels[i]) === id) return Number(table.values[i]);
+          return 0;
+        });
+
+        if (figures.some(function (figure) { return figure === null; })) {
+          log('ranking left alone, some videos had no answer');
+          return false;
+        }
+
+        ranking.entities.forEach(function (item, index) { item.value.double = figures[index]; });
+        ranking.entities.sort(function (a, b) { return b.value.double - a.value.double; });
+        ranking.entities.forEach(function (item) { item.rank = placeOf(item.value.double, figures); });
+
+        log('ranking rebuilt from engaged views', figures);
+        return true;
+      });
+    }).catch(function (error) {
+      log('ranking left alone', error);
+      return false;
     });
   }
 
@@ -1495,12 +1635,31 @@
       // The queries were asked for the engaged metric, so the answer names it;
       // the caller's own bookkeeping expects the name it asked with.
       renameMetricDeeply(payload, TARGET_METRIC, SOURCE_METRIC);
+
+      // Those columns were answered with the engaged metric and renamed back,
+      // so they hold engaged figures even though they carry the old name.
+      ctx.preConverted = metricColumnsNamed(payload, SOURCE_METRIC);
       if (ctx.typical) applyTypical(payload, ctx.typical);
       markConverted('dashboard');
 
       return convertAnalytics(payload, ctx).then(function () { return true; });
     }
   };
+
+  function metricColumnsNamed(payload, type) {
+    var found = [];
+    (function walk(node, depth) {
+      if (depth > 16 || node === null || typeof node !== 'object') return;
+      if (Array.isArray(node)) { for (var i = 0; i < node.length; i++) walk(node[i], depth + 1); return; }
+      if (Array.isArray(node.metricColumns)) {
+        node.metricColumns.forEach(function (column) {
+          if (column && column.metric && column.metric.type === type) found.push(column);
+        });
+      }
+      Object.keys(node).forEach(function (key) { walk(node[key], depth + 1); });
+    })(payload, 0);
+    return found;
+  }
 
   function renameMetricDeeply(node, from, to) {
     if (node === null || typeof node !== 'object') return;

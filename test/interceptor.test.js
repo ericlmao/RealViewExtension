@@ -1059,6 +1059,102 @@ test("the latest-video card's views row is converted", async () => {
   assert.strictEqual(env.attributes['data-realview-converted-analytics'], 'yes', 'so the card no longer holds the wording back');
 });
 
+test('the latest-video ranking is rebuilt from engaged views', async () => {
+  // Studio ranks the newest video against recent uploads over the same stretch
+  // of each one's life. Raw order here is A, B, C; engaged order is C, A, B.
+  const now = Date.now();
+  const ranking = { entities: [
+    { rank: 1, entity: { videoId: 'vidA' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 900 } },
+    { rank: 2, entity: { videoId: 'vidB' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 500 } },
+    { rank: 3, entity: { videoId: 'vidC' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 100 } }
+  ] };
+  const payload = { cards: [{ entitySnapshotCardData: { video: { externalVideoId: 'vidA' }, ranking } }] };
+
+  const engaged = { vidA: 20, vidB: 5, vidC: 60 };
+  const windows = {};
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'list_creator_videos': () => ({ status: 200, text: JSON.stringify({ videos: [
+      { videoId: 'vidA', timePublishedSeconds: String(Math.floor((now - 3 * 3600000) / 1000)) },
+      { videoId: 'vidB', timePublishedSeconds: String(Math.floor((now - 40 * 3600000) / 1000)) },
+      { videoId: 'vidC', timePublishedSeconds: String(Math.floor((now - 90 * 3600000) / 1000)) }
+    ] }) }),
+    'yta_web/join': (body) => ({
+      status: 200,
+      text: JSON.stringify({
+        results: JSON.parse(body).nodes.map((node) => {
+          const id = (node.value.query.restricts.find((r) => r.dimension.type === 'VIDEO') || { inValues: [] }).inValues[0];
+          const range = node.value.query.timeRange.unixTimeRange;
+          if (id && range) windows[id] = Number(range.exclusiveEnd) - Number(range.inclusiveStart);
+          return { key: node.key, value: { resultTable: {
+            dimensionColumns: [{ dimension: { type: 'VIDEO' }, strings: { values: [id] } }],
+            metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: [engaged[id] || 0] } }]
+          } } };
+        })
+      })
+    })
+  });
+
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const entities = JSON.parse(result.text).cards[0].entitySnapshotCardData.ranking.entities;
+
+  assert.deepStrictEqual(entities.map((e) => e.entity.videoId), ['vidC', 'vidA', 'vidB'], 'reordered by engaged views');
+  assert.deepStrictEqual(entities.map((e) => e.value.double), [60, 20, 5], 'showing the engaged figures');
+  assert.deepStrictEqual(entities.map((e) => e.rank), [1, 2, 3], 'and renumbered');
+
+  const spans = Object.values(windows);
+  assert.strictEqual(new Set(spans).size, 1, 'every video measured over the same length of its own life');
+});
+
+test('videos share a place when their figures tie', async () => {
+  const now = Date.now();
+  const ranking = { entities: ['vidA', 'vidB', 'vidC'].map((id, i) => ({
+    rank: i + 1, entity: { videoId: id }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 10 - i }
+  })) };
+  const payload = { cards: [{ entitySnapshotCardData: { video: { externalVideoId: 'vidA' }, ranking } }] };
+
+  const engaged = { vidA: 1, vidB: 0, vidC: 0 };
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'list_creator_videos': () => ({ status: 200, text: JSON.stringify({ videos: ['vidA', 'vidB', 'vidC'].map((id, i) => ({ videoId: id, timePublishedSeconds: String(Math.floor((now - (2 + i * 10) * 3600000) / 1000)) })) }) }),
+    'yta_web/join': (body) => ({
+      status: 200,
+      text: JSON.stringify({ results: JSON.parse(body).nodes.map((node) => {
+        const id = (node.value.query.restricts.find((r) => r.dimension.type === 'VIDEO') || { inValues: [] }).inValues[0];
+        return { key: node.key, value: { resultTable: {
+          dimensionColumns: [{ dimension: { type: 'VIDEO' }, strings: { values: [id] } }],
+          metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: [engaged[id]] } }]
+        } } };
+      }) })
+    })
+  });
+
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const entities = JSON.parse(result.text).cards[0].entitySnapshotCardData.ranking.entities;
+  assert.deepStrictEqual(entities.map((e) => e.rank), [1, 2, 2], 'the two tied videos share second place');
+});
+
+test('a ranking is left alone when a video cannot be dated', async () => {
+  const ranking = { entities: [
+    { rank: 1, entity: { videoId: 'vidA' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 900 } },
+    { rank: 2, entity: { videoId: 'vidB' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 500 } }
+  ] };
+  const payload = { cards: [{ entitySnapshotCardData: { video: { externalVideoId: 'vidA' }, ranking } }] };
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    // Only one of the two videos comes back with a publish time.
+    'list_creator_videos': () => ({ status: 200, text: JSON.stringify({ videos: [{ videoId: 'vidA', timePublishedSeconds: '1780000000' }] }) }),
+    'yta_web/join': joinResponder()
+  });
+
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const entities = JSON.parse(result.text).cards[0].entitySnapshotCardData.ranking.entities;
+  assert.deepStrictEqual(entities.map((e) => e.value.double), [900, 500], 'figures untouched');
+  assert.deepStrictEqual(entities.map((e) => e.rank), [1, 2], 'order untouched');
+});
+
 test('an unrelated request is not touched', async () => {
   const env = createEnvironment({ 'creator/get_creator_channels': '{"channels":[]}' });
   const result = await request(env, 'https://studio.youtube.com/youtubei/v1/creator/get_creator_channels?alt=json', '{}');

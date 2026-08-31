@@ -59,13 +59,15 @@
   //   "Views · Last 48 hours"       the leading half of one
   //   "Latest activity, Views: ..." the spoken description of a card
   //   "Total views for the ..."      the note explaining what a card counts
+  //   "Ranking by views"             the heading over the latest-video ranking
   //
   // A video title such as "my views on this" matches none of them.
   var PATTERNS = [
     /^(\W*)(Views|views)$/,
     /^(\W*)(Views|views)(\s*[·|].*)$/,
     /^(.*,\s*)(Views|views)(\s*:.*)$/,
-    /^(Total\s+)(views)(\s+for\b.*)$/
+    /^(Total\s+)(views)(\s+for\b.*)$/,
+    /^(Ranking by\s+)(views)$/
   ];
   var MAX_LABEL = 100;
 

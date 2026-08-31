@@ -85,13 +85,15 @@ On the channel this was built against the difference is real: over 365 days the 
   its own figures rather than as a metric column, and the latest-video card reports each of its
   metrics as a row naming the video once at the top. Both are converted.
 
-Not covered: the **ranking** on the latest-video card — "6 of 10", and the band under it. Those
-are the server's comparison of the video against recent ones, and they only appear a few hours
-after publishing, so their shape has not been seen yet. The figures on that card are converted;
-the ranking is still the server's.
+- **The latest-video ranking** — "6 of 10", and the list of recent videos behind it. Studio ranks
+  the newest video against recent uploads over the same stretch of each one's life, counted in
+  raw views. RealView asks Studio's video list for each one's publish time, measures every video
+  over that same span from its own start, reorders the list by engaged views and renumbers it.
+  Videos that tie share a place, as Studio does it. If any video in the list cannot be dated, the
+  ranking is left exactly as the server sent it rather than half rebuilt.
 
-More generally, any card that mentions views and had nothing converted inside it is taken at its
-word, and the wording on that screen is left as Studio wrote it.
+Any card that mentions views and had nothing converted inside it is taken at its word, and the
+wording on that screen is left as Studio wrote it.
 
 A screen is only relabelled once every figure on it has really been converted, so a raw count is
 never captioned as an engaged one. Two things are exempt: sparklines split by two dimensions at
