@@ -74,6 +74,10 @@ On the channel this was built against the difference is real: over 365 days the 
 - **Channel dashboard** — the summary card and top content.
 - **Content tab** — the video list's lifetime view counts.
 
+Not covered: the **latest video performance** card, whose figures arrive in a shape the
+substitution cannot reach. A screen carrying that card is left with Studio's own wording, so its
+raw count is never captioned as an engaged one.
+
 `relabel.js` corrects the wording on the analytics screens, the dashboard and the video list —
 and only once the interceptor confirms the numbers on that surface really changed.
 
@@ -110,6 +114,18 @@ labels both live in the same payload: those are renamed together, which is why t
 `relabel.js`, and only once the interceptor confirms every figure on that screen really was
 converted.
 
+### The typical range
+
+Studio compares a figure against a band it calls typical, and the server only models that band
+for raw views: ask it for the engaged one and it answers with nothing, which is what turned the
+dashboard's arrow into "Comparison not available".
+
+So RealView leaves the typical query as Studio wrote it — that also keeps watch time's own band
+intact — and replaces the views part with a band worked out from the channel's own engaged
+history: the same number of days over each of the preceding eight periods, reduced to a middle
+value and a quartile range. Fewer than four periods with data and the comparison is dropped
+rather than guessed at.
+
 ### Speed
 
 The obvious way to write this costs a round trip: fetch the screen, then fetch its engaged
@@ -129,9 +145,8 @@ show engaged views while displaying raw ones. RealView never does this:
   response is passed through untouched. A screen can never be left waiting on this extension.
 - A card is only renamed when its figures were really replaced.
 - The daily chart is dropped rather than left drawn from raw views under an engaged label.
-- "About the same as usual" and the "views are counted differently now" notice are computed from
-  the raw metric by the server and cannot be recomputed here, so they are removed from converted
-  cards.
+- The "views are counted differently now" notice is removed from converted cards, since it
+  describes a metric they are no longer showing.
 - A table broken down by two dimensions at once cannot be rebuilt from a one-dimensional answer,
   so it is left alone rather than half-converted.
 - An error from Studio itself is relayed exactly as it arrived, so Studio's own retry and error

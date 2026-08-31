@@ -534,6 +534,90 @@ test('the channel dashboard asks for the engaged metric and reads back its own',
   assert.strictEqual(env.attributes['data-realview-converted-dashboard'], 'yes');
 });
 
+test('the card gets a typical range worked out from engaged history', async () => {
+  const env = createEnvironment({
+    'get_screen': screenResponse(),
+    'yta_web/join': (body) => {
+      const parsed = JSON.parse(body);
+      return {
+        status: 200,
+        text: JSON.stringify({
+          results: parsed.nodes.map((node) => {
+            const query = node.value.query;
+            const daily = query.dimensions[0] && query.dimensions[0].type === 'DAY';
+            const start = query.timeRange.dateIdRange.inclusiveStart;
+            const end = query.timeRange.dateIdRange.exclusiveEnd;
+            // The history query is the long one; answer it with a run of days.
+            if (daily && String(end - start).length > 2) {
+              const labels = [];
+              const values = [];
+              let ms = dayStart(-1 - 8 * 7);
+              for (let i = 0; i < 8 * 7; i++) { labels.push(dateId(ms)); values.push(1 + Math.floor(i / 7)); ms += DAY; }
+              return { key: node.key, value: { resultTable: { dimensionColumns: [{ dimension: { type: 'DAY' }, dateIds: { values: labels } }], metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values } }] } } };
+            }
+            return { key: node.key, value: { resultTable: { metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: [7] } }] } } };
+          })
+        })
+      };
+    }
+  });
+
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const content = JSON.parse(result.text).cards[1].keyMetricCardData.keyMetricTabs[0].primaryContent;
+
+  assert.ok(content.typicalPerformanceTotal, 'the card keeps a typical range rather than losing it');
+  const band = content.typicalPerformanceTotal.typicalRange;
+  assert.ok(band.lowerBound <= content.typicalPerformanceTotal.typicalValue, 'band brackets the middle value');
+  assert.ok(band.upperBound >= content.typicalPerformanceTotal.typicalValue, 'band brackets the middle value');
+  assert.notStrictEqual(content.typicalPerformanceTotal.typicalValue, 30, 'not the raw figure the fixture shipped with');
+});
+
+test('a card with too little history loses its typical range rather than inventing one', async () => {
+  const env = createEnvironment({ 'get_screen': screenResponse(), 'yta_web/join': joinResponder() });
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const content = JSON.parse(result.text).cards[1].keyMetricCardData.keyMetricTabs[0].primaryContent;
+  assert.strictEqual(content.typicalPerformanceTotal, undefined);
+});
+
+test('a typical performance query is never asked for the engaged metric', async () => {
+  // The server answers such a query with nothing, which is what removed the
+  // comparison from the dashboard in the first place.
+  const env = createEnvironment({ 'get_channel_dashboard': () => ({ status: 200, text: '{"cards":[]}' }) });
+  const body = JSON.stringify({
+    context: {},
+    dashboardParams: {
+      channelId: 'UCtest',
+      nodes: [
+        { key: 'current', value: { query: { metrics: [{ type: 'EXTERNAL_VIEWS' }], timeRange: { dateIdRange: { inclusiveStart: 20260803, exclusiveEnd: 20260831 } } } } },
+        { key: 'typical', value: { getTypicalPerformance: { query: { metrics: [{ metric: { type: 'EXTERNAL_VIEWS' } }] } } } }
+      ]
+    }
+  });
+  await request(env, 'https://studio.youtube.com/youtubei/v1/creator/get_channel_dashboard?alt=json', body);
+
+  const sent = JSON.parse(env.sent.find((e) => e.url.includes('get_channel_dashboard')).body);
+  const nodes = sent.dashboardParams.nodes;
+  assert.strictEqual(nodes[0].value.query.metrics[0].type, 'ENGAGED_VIEWS', 'the ordinary query is swapped');
+  assert.strictEqual(nodes[1].value.getTypicalPerformance.query.metrics[0].metric.type, 'EXTERNAL_VIEWS', 'the typical query is left alone');
+});
+
+test('a screen carrying a latest-video snapshot is not relabelled', async () => {
+  // That card's figures are not metric columns, so they stay raw. Relabelling
+  // the screen would caption a raw count as an engaged one.
+  const withSnapshot = JSON.parse(screenResponse());
+  withSnapshot.cards.push({ entitySnapshotCardData: { item: { viewCount: '149600' } } });
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(withSnapshot),
+    'yta_web/join': joinResponder({ vidA: 11, vidB: 4 })
+  });
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+
+  assert.strictEqual(env.attributes['data-realview-converted-analytics'], undefined, 'wording left as Studio wrote it');
+  const column = JSON.parse(result.text).cards[2].tableCardData.mainTableData.metricColumns[0];
+  assert.deepStrictEqual(column.counts.values, [11, 4], 'the figures it can convert are still converted');
+});
+
 test('an unrelated request is not touched', async () => {
   const env = createEnvironment({ 'creator/get_creator_channels': '{"channels":[]}' });
   const result = await request(env, 'https://studio.youtube.com/youtubei/v1/creator/get_creator_channels?alt=json', '{}');

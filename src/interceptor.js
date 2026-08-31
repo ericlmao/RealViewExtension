@@ -100,6 +100,13 @@
     return d.getUTCFullYear() * 10000 + (d.getUTCMonth() + 1) * 100 + d.getUTCDate();
   }
 
+  function dateIdToMs(id) {
+    var year = Math.floor(id / 10000);
+    var month = Math.floor((id % 10000) / 100);
+    var day = id % 100;
+    return Date.UTC(year, month - 1, day);
+  }
+
   function dayRange(startMs, endMs, offsetSecs) {
     return {
       kind: 'days',
@@ -412,7 +419,15 @@
           value: { query: buildQuery({ dimensions: [], range: previousRange(range, ctx.offsetSecs), restricts: ctx.restricts, currency: ctx.currency }) }
         });
       }
-      plans.push({ kind: 'headline', content: content, rawTotal: content.total, keys: keys, headers: found.headers });
+      if (content.typicalPerformanceTotal) {
+        var typicalNode = typicalHistoryNode('rv_typical_' + index, ctx, range);
+        if (typicalNode) {
+          nodes.push(typicalNode);
+          keys.typical = typicalNode.key;
+        }
+      }
+
+      plans.push({ kind: 'headline', content: content, rawTotal: content.total, range: range, keys: keys, headers: found.headers });
     });
 
     found.tables.forEach(function (entry, index) {
@@ -450,7 +465,25 @@
       plans.push({ kind: 'table', entry: entry, labels: dimension.labels, key: key });
     });
 
-    return { nodes: nodes, plans: plans, found: found };
+    return { nodes: nodes, plans: plans, found: found, unconverted: hasUnhandledFigures(payload) };
+  }
+
+  // Cards whose view figures do not arrive as metric columns cannot be
+  // converted by the substitution above. The latest-video snapshot is one:
+  // it reports a video's count and its standing among recent uploads.
+  function hasUnhandledFigures(payload) {
+    var found = false;
+    (function walk(node, depth) {
+      if (found || depth > 14 || node === null || typeof node !== 'object') return;
+      if (Array.isArray(node)) {
+        for (var i = 0; i < node.length; i++) walk(node[i], depth + 1);
+        return;
+      }
+      if (node.entitySnapshotCardData) { found = true; return; }
+      var keys = Object.keys(node);
+      for (var k = 0; k < keys.length; k++) walk(node[keys[k]], depth + 1);
+    })(payload, 0);
+    return found;
   }
 
   function applyConversion(plan, results, ctx) {
@@ -490,10 +523,15 @@
           delete item.content.mainSeries;
         }
 
-        // Both are computed from the raw metric by the server and cannot be
-        // recomputed here; the anomaly is the "views are counted differently
-        // now" notice, which no longer applies to a converted card.
-        delete item.content.typicalPerformanceTotal;
+        // The server models a typical range for raw views only, so the card's
+        // own one is replaced with a band worked out from the channel's engaged
+        // history. The anomaly is the "views are counted differently now"
+        // notice, which does not apply to a card no longer showing those views.
+        var history = item.keys.typical ? results[item.keys.typical] : null;
+        var typical = history ? typicalFromHistory(history, ctx, item.range) : null;
+        if (typical) item.content.typicalPerformanceTotal = typical;
+        else delete item.content.typicalPerformanceTotal;
+
         delete item.content.anomalies;
       }
 
@@ -518,7 +556,10 @@
 
     // Only claim the wording is safe to change when every table on the screen
     // really was converted; a half-converted screen keeps Studio's own labels.
-    if (tablesFound > 0 && tablesFound === tablesConverted) markConverted('analytics');
+    // The latest-video snapshot reports its figures outside the shapes handled
+    // here, so a screen carrying one is not relabelled either - otherwise its
+    // raw count would be captioned as an engaged one.
+    if (tablesFound > 0 && tablesFound === tablesConverted && !plan.unconverted) markConverted('analytics');
 
     return changed;
   }
@@ -607,6 +648,82 @@
   }
 
   /* ------------------------------------------------------------- proxying */
+
+  // A dashboard request describes its own period inside the queries it carries.
+  function dashboardContext(xhr, requestBody) {
+    var parsed;
+    try { parsed = JSON.parse(requestBody); } catch (e) { return null; }
+    if (!parsed.context) return null;
+
+    var channelId = null;
+    var currency = 'USD';
+    var range = null;
+
+    (function walk(node, depth) {
+      if (depth > 14 || node === null || typeof node !== 'object') return;
+      if (Array.isArray(node)) {
+        for (var i = 0; i < node.length; i++) walk(node[i], depth + 1);
+        return;
+      }
+      if (!channelId && typeof node.externalChannelId === 'string') channelId = node.externalChannelId;
+      if (!channelId && typeof node.channelId === 'string') channelId = node.channelId;
+      if (typeof node.currency === 'string') currency = node.currency;
+      if (!range && node.dateIdRange && node.dateIdRange.inclusiveStart && node.dateIdRange.exclusiveEnd) {
+        range = dayRange(dateIdToMs(node.dateIdRange.inclusiveStart), dateIdToMs(node.dateIdRange.exclusiveEnd), 0);
+      }
+      var keys = Object.keys(node);
+      for (var k = 0; k < keys.length; k++) walk(node[keys[k]], depth + 1);
+    })(parsed, 0);
+
+    if (!channelId) return null;
+    return {
+      context: parsed.context,
+      headers: xhr.__realViewHeaders || {},
+      currency: currency,
+      offsetSecs: 0,
+      restricts: [{ dimension: { type: 'USER' }, inValues: [channelId] }],
+      range: range
+    };
+  }
+
+  // Puts the worked-out range where the server would have put its own, and
+  // points it at the engaged figure the rest of the response now carries.
+  function applyTypical(payload, stats) {
+    var current = null;
+    var column = null;
+
+    (function walk(node, depth) {
+      if (depth > 14 || node === null || typeof node !== 'object') return;
+      if (Array.isArray(node)) {
+        for (var i = 0; i < node.length; i++) walk(node[i], depth + 1);
+        return;
+      }
+      // The period's engaged total, as already substituted elsewhere.
+      if (current === null && Array.isArray(node.metricColumns) && !node.dimensionColumns) {
+        for (var c = 0; c < node.metricColumns.length; c++) {
+          var entry = node.metricColumns[c];
+          if (entry && entry.metric && entry.metric.type === SOURCE_METRIC && entry.counts && entry.counts.values.length) {
+            current = Number(entry.counts.values[0]);
+          }
+        }
+      }
+      if (node.getTypicalPerformance && node.getTypicalPerformance.result) {
+        var columns = node.getTypicalPerformance.result.metricColumns || [];
+        for (var m = 0; m < columns.length; m++) {
+          var candidate = columns[m];
+          var type = candidate.metric && candidate.metric.metric && candidate.metric.metric.type;
+          if (type === SOURCE_METRIC) column = candidate;
+        }
+      }
+      var keys = Object.keys(node);
+      for (var k = 0; k < keys.length; k++) walk(node[keys[k]], depth + 1);
+    })(payload, 0);
+
+    if (!column) return false;
+    column.stats = [stats];
+    if (current !== null) column.currentValue = { column: { type: SOURCE_METRIC }, values: [{ double: current }] };
+    return true;
+  }
 
   function requestContext(xhr, requestBody) {
     var parsed;
@@ -744,6 +861,101 @@
 
   /* --------------------------------------------------------- entry points */
 
+  // Swaps the metric a request asks for, but never inside a typical performance
+  // query. The server models a typical range for raw views only - asking it for
+  // the engaged one comes back empty - so that query is left as Studio wrote it
+  // and its views figures are replaced afterwards with a range worked out here.
+  function swapRequestedMetric(text) {
+    var parsed;
+    try { parsed = JSON.parse(text); } catch (e) { return text; }
+
+    var swapped = 0;
+    (function walk(node, depth, inTypical) {
+      if (depth > 14 || node === null || typeof node !== 'object') return;
+      if (Array.isArray(node)) {
+        for (var i = 0; i < node.length; i++) {
+          if (node[i] === SOURCE_METRIC && !inTypical) { node[i] = TARGET_METRIC; swapped++; }
+          else walk(node[i], depth + 1, inTypical);
+        }
+        return;
+      }
+      Object.keys(node).forEach(function (key) {
+        var typical = inTypical || key === 'getTypicalPerformance';
+        if (node[key] === SOURCE_METRIC && !typical) { node[key] = TARGET_METRIC; swapped++; }
+        else walk(node[key], depth + 1, typical);
+      });
+    })(parsed, 0, false);
+
+    if (!swapped) return text;
+    return JSON.stringify(parsed);
+  }
+
+  // The channel's own engaged history stands in for the typical range the server
+  // will not calculate: the same number of days, over each of the preceding
+  // periods, gives a middle value and a band to compare today's figure against.
+  var TYPICAL_PERIODS = 8;
+
+  function typicalHistoryNode(key, ctx, range) {
+    if (!ctx.restricts.length || range.kind !== 'days') return null;
+    var span = range.endMs - range.startMs;
+    var history = dayRange(range.startMs - TYPICAL_PERIODS * span, range.startMs, ctx.offsetSecs);
+    return {
+      key: key,
+      value: { query: buildQuery({ dimensions: [{ type: 'DAY' }], range: history, restricts: ctx.restricts, currency: ctx.currency }) }
+    };
+  }
+
+  // Reduces a run of daily figures into the middle value and band of the
+  // periods before this one.
+  function typicalFromHistory(table, ctx, range) {
+    if (!table || !table.labels) return null;
+    var span = range.endMs - range.startMs;
+    {
+
+      var byDate = {};
+      for (var i = 0; i < table.labels.length; i++) byDate[String(table.labels[i])] = Number(table.values[i]);
+
+      // Total each preceding period, walking backwards a period at a time.
+      var totals = [];
+      for (var p = 1; p <= TYPICAL_PERIODS; p++) {
+        var periodStart = range.startMs - p * span;
+        var total = 0;
+        var counted = 0;
+        for (var ms = periodStart; ms < periodStart + span; ms += DAY_MS) {
+          var id = String(toDateId(ms, ctx.offsetSecs));
+          if (Object.prototype.hasOwnProperty.call(byDate, id)) { total += byDate[id]; counted++; }
+        }
+        if (counted) totals.push(total);
+      }
+
+      if (totals.length < 4) return null;
+      totals.sort(function (a, b) { return a - b; });
+
+      function percentile(fraction) {
+        var position = (totals.length - 1) * fraction;
+        var low = Math.floor(position);
+        var high = Math.ceil(position);
+        return totals[low] + (totals[high] - totals[low]) * (position - low);
+      }
+
+      var typical = Math.round(percentile(0.5));
+      var lower = Math.round(percentile(0.25));
+      var upper = Math.round(percentile(0.75));
+      if (lower === upper) { lower = Math.min(lower, typical); upper = Math.max(upper, typical); }
+
+      log('typical range worked out from', totals.length, 'periods', { typical: typical, lower: lower, upper: upper });
+      return { typicalValue: typical, typicalRange: { lowerBound: lower, upperBound: upper } };
+    }
+  }
+
+  function computeTypical(ctx, range) {
+    var node = typicalHistoryNode('rv_typical', ctx, range);
+    if (!node) return Promise.resolve(null);
+    return runQueries(ctx, [node]).then(function (results) {
+      return typicalFromHistory(results.rv_typical, ctx, range);
+    });
+  }
+
   function restoreMetric(text) {
     return text.split('"' + TARGET_METRIC + '"').join('"' + SOURCE_METRIC + '"');
   }
@@ -761,6 +973,8 @@
         { key: 'rv_series_0', value: { query: buildQuery({ dimensions: [{ type: 'DAY' }], range: range, restricts: ctx.restricts, currency: ctx.currency }) } },
         { key: 'rv_prev_0', value: { query: buildQuery({ dimensions: [], range: previousRange(range, ctx.offsetSecs), restricts: ctx.restricts, currency: ctx.currency }) } }
       ];
+      var guessedTypical = typicalHistoryNode('rv_typical_0', ctx, range);
+      if (guessedTypical) nodes.push(guessedTypical);
       return { range: range, promise: runQueries(ctx, nodes) };
     },
     run: function (payload, ctx, prefetch) {
@@ -842,25 +1056,44 @@
       var mixed = body.indexOf('"' + TARGET_METRIC + '"') !== -1;
       if (ours || !hasSource || mixed) return nativeSend.apply(xhr, args);
 
+      // The typical range is worked out here, alongside the request, so it is
+      // usually ready by the time Studio reads the answer.
+      var typical = { stats: null };
+      var ctx = dashboardContext(xhr, body);
+      if (ctx && ctx.range) {
+        computeTypical(ctx, ctx.range).then(function (stats) { typical.stats = stats; }).catch(function () {});
+      }
+
       var textDescriptor = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'responseText');
       var responseDescriptor = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'response');
+      var cache = { from: null, to: null };
+
+      function transform(raw) {
+        if (typeof raw !== 'string' || raw === '') return raw;
+        if (cache.from === raw) return cache.to;
+        var out = restoreMetric(raw);
+        if (typical.stats) {
+          try {
+            var payload = JSON.parse(out);
+            if (applyTypical(payload, typical.stats)) out = JSON.stringify(payload);
+          } catch (e) { /* leave the renamed text as it is */ }
+        }
+        cache.from = raw;
+        cache.to = out;
+        return out;
+      }
+
       Object.defineProperty(xhr, 'responseText', {
         configurable: true,
-        get: function () {
-          var raw = textDescriptor.get.call(xhr);
-          return typeof raw === 'string' ? restoreMetric(raw) : raw;
-        }
+        get: function () { return transform(textDescriptor.get.call(xhr)); }
       });
       Object.defineProperty(xhr, 'response', {
         configurable: true,
-        get: function () {
-          var raw = responseDescriptor.get.call(xhr);
-          return typeof raw === 'string' ? restoreMetric(raw) : raw;
-        }
+        get: function () { return transform(responseDescriptor.get.call(xhr)); }
       });
       markConverted('dashboard');
       log('dashboard query converted');
-      return nativeSend.call(xhr, body.split('"' + SOURCE_METRIC + '"').join('"' + TARGET_METRIC + '"'));
+      return nativeSend.call(xhr, swapRequestedMetric(body));
     }
 
     // The card request names the metrics its cards should use, so asking for
