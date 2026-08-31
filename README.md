@@ -78,7 +78,9 @@ On the channel this was built against the difference is real: over 365 days the 
   themselves; those shares are worked out again from the converted figures. Traffic *detail*
   rows — a search term, a linking site — are asked for one kind of source at a time, since the
   server refuses a query that does not say which kind it means; the row names carry that as a
-  prefix.
+  prefix. A table listing sources *and* their details together — "YouTube recommendations" with
+  "YouTube Home" beneath it — is rebuilt from both levels at once, since the server answers each
+  on its own but not the two together.
 - **View counts a card keeps for itself** — the retention curve reports a video's views
   alongside its own figures rather than as a metric column, and that is converted too.
 

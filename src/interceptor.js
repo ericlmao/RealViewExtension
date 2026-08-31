@@ -448,6 +448,25 @@
     return null;
   }
 
+  // A table listing sources and their details together: "YouTube recommendations"
+  // with "YouTube Home" and "Up next" beneath it. The server will not answer a
+  // query for both at once, but it will answer each on its own, and a detail
+  // belongs to exactly one source, so the two answers rebuild the table.
+  function sourceHierarchy(table) {
+    var columns = table.dimensionColumns;
+    if (!columns || columns.length !== 2) return null;
+
+    var types = null;
+    var details = null;
+    for (var i = 0; i < columns.length; i++) {
+      var type = columns[i].dimension && columns[i].dimension.type;
+      if (type === 'TRAFFIC_SOURCE_TYPE') types = columnLabels(columns[i]);
+      if (type === 'TRAFFIC_SOURCE_DETAIL') details = columnLabels(columns[i]);
+    }
+    if (!types || !details || types.length !== details.length || !types.length) return null;
+    return { types: types, details: details };
+  }
+
   function tableDimension(table) {
     var columns = table.dimensionColumns;
     // A table broken down by two dimensions at once, such as views per hour per
@@ -584,6 +603,44 @@
     });
 
     found.tables.forEach(function (entry, index) {
+      var hierarchy = sourceHierarchy(entry.table);
+      if (hierarchy) {
+        var pairRange = entry.realtime ? hourlyRange : (ctx.range || hourlyRange);
+        if (!pairRange) return;
+
+        var typeKey = 'rv_pairs_' + index + '_type';
+        nodes.push({
+          key: typeKey,
+          value: { query: buildQuery({ dimensions: [{ type: 'TRAFFIC_SOURCE_TYPE' }], range: pairRange, restricts: ctx.restricts, currency: ctx.currency }) }
+        });
+
+        var prefixes = {};
+        hierarchy.details.forEach(function (label) {
+          var name = String(label || '');
+          if (!name) return;
+          prefixes[name.split('.')[0]] = true;
+        });
+        var detailKeys = Object.keys(prefixes).map(function (prefix, part) {
+          var key = 'rv_pairs_' + index + '_detail' + part;
+          nodes.push({
+            key: key,
+            value: {
+              query: buildQuery({
+                dimensions: [{ type: 'TRAFFIC_SOURCE_DETAIL' }],
+                range: pairRange,
+                restricts: ctx.restricts.concat([{ dimension: { type: 'TRAFFIC_SOURCE_TYPE' }, inValues: [prefix] }]),
+                currency: ctx.currency,
+                limit: Math.max(hierarchy.details.length, 25)
+              })
+            }
+          });
+          return key;
+        });
+
+        plans.push({ kind: 'pairs', entry: entry, hierarchy: hierarchy, typeKey: typeKey, detailKeys: detailKeys });
+        return;
+      }
+
       var dimension = tableDimension(entry.table);
       if (!dimension || !dimension.labels || !dimension.labels.length) return;
 
@@ -879,6 +936,46 @@
           converted.push(entity.totals);
           changed = true;
         });
+      }
+
+      if (item.kind === 'pairs') {
+        tablesFound++;
+        var typeAnswer = results[item.typeKey];
+        var detailAnswers = item.detailKeys.map(function (key) { return results[key]; });
+        if (!typeAnswer || detailAnswers.some(function (answer) { return !answer; })) {
+          log('no answer for the traffic hierarchy');
+          return;
+        }
+
+        var byType = {};
+        if (typeAnswer.labels) {
+          for (var ti = 0; ti < typeAnswer.labels.length; ti++) byType[String(typeAnswer.labels[ti])] = Number(typeAnswer.values[ti]);
+        }
+        var byDetail = {};
+        detailAnswers.forEach(function (answer) {
+          if (!answer.labels) return;
+          for (var di = 0; di < answer.labels.length; di++) byDetail[String(answer.labels[di])] = Number(answer.values[di]);
+        });
+
+        // A row naming a detail takes the detail's figure; a row naming only a
+        // source takes the source's.
+        var pairValues = item.hierarchy.types.map(function (type, row) {
+          var detail = String(item.hierarchy.details[row] || '');
+          if (detail && Object.prototype.hasOwnProperty.call(byDetail, detail)) return byDetail[detail];
+          if (!detail && Object.prototype.hasOwnProperty.call(byType, String(type))) return byType[String(type)];
+          return 0;
+        });
+
+        if (item.entry.column.counts) item.entry.column.counts.values = pairValues;
+        var pairTotal = pairValues.reduce(function (a, b) { return a + b; }, 0);
+        (item.entry.table.metricColumns || []).forEach(function (column) {
+          if (!column.percentages || !column.metric || column.metric.type !== SOURCE_METRIC) return;
+          column.percentages.values = pairValues.map(function (value) { return pairTotal ? (value / pairTotal) * 100 : 0; });
+        });
+
+        converted.push(item.entry.column);
+        tablesConverted++;
+        changed = true;
       }
 
       if (item.kind === 'table') {

@@ -989,6 +989,53 @@ test("a card's own view count for a video is converted too", async () => {
   assert.strictEqual(env.attributes['data-realview-converted-analytics'], 'yes');
 });
 
+test('a table listing sources with their details is rebuilt from both', async () => {
+  // "YouTube recommendations" with "YouTube Home" and "Up next" beneath it. The
+  // server answers each level on its own but not the two together.
+  const payload = { cards: [{ tableCardData: { mainTableData: {
+    dimensionColumns: [
+      { dimension: { type: 'TRAFFIC_SOURCE_TYPE' }, enumValues: { values: ['YT_RELATED', 'YT_RELATED', 'YT_RELATED', 'SUBSCRIBER'] } },
+      { dimension: { type: 'TRAFFIC_SOURCE_DETAIL' }, strings: { values: ['', 'YT_RELATED.home', 'YT_RELATED.upnext', ''] } }
+    ],
+    metricColumns: [
+      { metric: { type: 'EXTERNAL_VIEWS' }, counts: { values: [130400, 120400, 10000, 11600] } },
+      { metric: { type: 'EXTERNAL_VIEWS', asPercentagesOfTotal: true }, percentages: { values: [86.3, 79.7, 6.6, 7.7] } }
+    ]
+  } } }] };
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'yta_web/join': (body) => ({
+      status: 200,
+      text: JSON.stringify({
+        results: JSON.parse(body).nodes.map((node) => {
+          const dimension = (node.value.query.dimensions[0] || {}).type;
+          if (dimension === 'TRAFFIC_SOURCE_TYPE') {
+            return { key: node.key, value: { resultTable: {
+              dimensionColumns: [{ dimension: { type: 'TRAFFIC_SOURCE_TYPE' }, enumValues: { values: ['YT_RELATED', 'SUBSCRIBER'] } }],
+              metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: [60, 8] } }]
+            } } };
+          }
+          if (dimension === 'TRAFFIC_SOURCE_DETAIL') {
+            return { key: node.key, value: { resultTable: {
+              dimensionColumns: [{ dimension: { type: 'TRAFFIC_SOURCE_DETAIL' }, strings: { values: ['YT_RELATED.home', 'YT_RELATED.upnext'] } }],
+              metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: [55, 5] } }]
+            } } };
+          }
+          return { key: node.key, value: { resultTable: { metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: [7] } }] } } };
+        })
+      })
+    })
+  });
+
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const columns = JSON.parse(result.text).cards[0].tableCardData.mainTableData.metricColumns;
+
+  assert.deepStrictEqual(columns[0].counts.values, [60, 55, 5, 8], 'parents from the source figures, children from the detail ones');
+  assert.deepStrictEqual(columns[1].percentages.values.map(Math.round), [47, 43, 4, 6], 'shares follow');
+  assert.strictEqual(env.attributes['data-realview-converted-analytics'], 'yes', 'and the wording may be corrected');
+});
+
 test('an unrelated request is not touched', async () => {
   const env = createEnvironment({ 'creator/get_creator_channels': '{"channels":[]}' });
   const result = await request(env, 'https://studio.youtube.com/youtubei/v1/creator/get_creator_channels?alt=json', '{}');
