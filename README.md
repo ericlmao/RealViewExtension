@@ -75,7 +75,12 @@ On the channel this was built against the difference is real: over 365 days the 
 - **Content tab** — the video list's lifetime view counts.
 - **Traffic sources, countries, devices and the rest** — the tables that break views down by
   something, including the ones that report only each row's share rather than the views
-  themselves; those shares are worked out again from the converted figures.
+  themselves; those shares are worked out again from the converted figures. Traffic *detail*
+  rows — a search term, a linking site — are asked for one kind of source at a time, since the
+  server refuses a query that does not say which kind it means; the row names carry that as a
+  prefix.
+- **View counts a card keeps for itself** — the retention curve reports a video's views
+  alongside its own figures rather than as a metric column, and that is converted too.
 
 Not covered: cards that report their figures in some shape other than a table of metric columns
 — the **latest video performance** card is one. Rather than enumerate them, any card that
@@ -146,8 +151,17 @@ on whole hours.
 ### One refused query is only one refused query
 
 The server fails an entire request when any single query inside it is unsupported. A batch that
-comes back with anything missing is therefore retried a query at a time, so an unsupported one
-costs only itself rather than every figure on the screen.
+comes back with anything missing is therefore sent again — first as a group, in case it simply
+did not arrive, then a query at a time, which is what finds the one the server will not accept.
+An unsupported query then costs only itself rather than every figure on the screen.
+
+All of that happens inside one time budget, which grows with the number of questions the screen
+asks: a screen wanting a dozen tables is given longer than one wanting two, and a backend that
+hangs still cannot hold the page. Running out of time is treated as slowness rather than
+malfunction, so it does not count towards standing the extension down.
+
+An answer with no rows in it is not a failure either: it means there were no engaged views in
+that window, so the table reads zero rather than staying raw.
 
 ### The typical range
 

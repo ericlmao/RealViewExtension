@@ -46,9 +46,18 @@
   // A query that has not answered by this point is abandoned and the original
   // response is delivered, so a slow or unreachable backend can never leave a
   // Studio screen spinning.
-  var QUERY_DEADLINE_MS = 4000;
+  // How long a screen may spend on queries in total, retries included. A batch
+  // that fails fast leaves room to try again; one that hangs does not. A screen
+  // asking about a dozen tables is given more room than one asking about two.
+  var QUERY_BUDGET_BASE_MS = 5000;
+  var QUERY_BUDGET_PER_QUERY_MS = 250;
+  var QUERY_BUDGET_CAP_MS = 10000;
+
+  function queryBudget(count) {
+    return Math.min(QUERY_BUDGET_CAP_MS, QUERY_BUDGET_BASE_MS + count * QUERY_BUDGET_PER_QUERY_MS);
+  }
   // The backstop for the whole conversion, not just one query.
-  var WATCHDOG_MS = 8000;
+  var WATCHDOG_MS = 15000;
   // After this many faults of the extension's own making, it stops taking part
   // for the rest of the page. A systematic problem then costs the engaged
   // figures rather than the screen.
@@ -288,7 +297,7 @@
       waits.push(promise.then(function (table) { return { key: node.key, table: table }; }));
     });
 
-    if (pending.length) sendBatch(ctx, pending, false);
+    if (pending.length) sendBatch(ctx, pending, 0, Date.now() + queryBudget(pending.length));
 
     return Promise.all(waits).then(function (answers) {
       var results = {};
@@ -302,7 +311,7 @@
   // A query the server will not accept fails the whole request it travels in,
   // so when a batch comes back with anything missing the stragglers are asked
   // for again one at a time. One unsupported query then costs only itself.
-  function sendBatch(ctx, pending, isolated) {
+  function sendBatch(ctx, pending, stage, until) {
     var settled = false;
     function finish(byKey) {
       if (settled) return;
@@ -313,18 +322,31 @@
       answered.forEach(function (item) { item.resolve(byKey[item.node.key]); });
 
       if (!missing.length) return;
-      if (isolated || pending.length === 1) {
-        missing.forEach(function (item) { item.resolve(null); });
+
+      // First the stragglers go out together, in case the batch simply did not
+      // arrive. Only then are they split up, which is what finds the single
+      // query the server will not accept.
+      var timeLeft = until - Date.now() > 500;
+      if (timeLeft && stage === 0 && missing.length < pending.length) {
+        log('retrying', missing.length, 'queries together');
+        sendBatch(ctx, missing, 1, until);
         return;
       }
-      log('retrying', missing.length, 'queries on their own');
-      missing.forEach(function (item) { sendBatch(ctx, [item], true); });
+      if (timeLeft && stage < 2 && missing.length > 1) {
+        log('retrying', missing.length, 'queries on their own');
+        missing.forEach(function (item) { sendBatch(ctx, [item], 2, until); });
+        return;
+      }
+      missing.forEach(function (item) { item.resolve(null); });
     }
 
+    var remaining = Math.max(500, until - Date.now());
     var timer = setTimeout(function () {
-      fault('query deadline reached');
+      // Being slow is not the same as being broken: the figures are simply not
+      // ready, and the screen is served as Studio sent it.
+      log('gave up waiting on', pending.length, 'queries');
       finish(null);
-    }, QUERY_DEADLINE_MS);
+    }, remaining);
 
     var body = {
       nodes: pending.map(function (item) { return item.node; }),
@@ -370,6 +392,7 @@
     var headline = [];
     var tables = [];
     var headers = [];
+    var entities = [];
 
     // The realtime card covers the last 48 hours rather than the screen's
     // period, and the video table inside it covers those same hours, so a table
@@ -381,6 +404,12 @@
         return;
       }
       if (node.metric === SOURCE_METRIC && typeof node.total === 'number') headline.push(node);
+
+      // Some cards carry a plain view count for a video alongside their own
+      // figures - the retention curve is one - rather than a metric column.
+      if (typeof node.videoId === 'string' && node.metricTotals && typeof node.metricTotals.views === 'number') {
+        entities.push({ videoId: node.videoId, totals: node.metricTotals });
+      }
       if (node.personalizedHeaderCardData && typeof node.personalizedHeaderCardData.title === 'string') {
         headers.push(node.personalizedHeaderCardData);
       }
@@ -399,7 +428,7 @@
     }
 
     walk(payload, 0, false);
-    return { headline: headline, tables: tables, headers: headers };
+    return { headline: headline, tables: tables, headers: headers, entities: entities };
   }
 
   // The gap between the first two buckets gives the granularity, so an hourly
@@ -410,6 +439,15 @@
     return { kind: 'hours', startMs: stamps[0], endMs: stamps[stamps.length - 1] + bucket };
   }
 
+  function columnLabels(column) {
+    if (!column) return null;
+    if (column.strings) return column.strings.values;
+    if (column.timestamps) return column.timestamps.values;
+    if (column.dateIds) return column.dateIds.values;
+    if (column.enumValues) return column.enumValues.values;
+    return null;
+  }
+
   function tableDimension(table) {
     var columns = table.dimensionColumns;
     // A table broken down by two dimensions at once, such as views per hour per
@@ -418,12 +456,7 @@
     var column = columns[0];
     if (!column || !column.dimension) return null;
     // A traffic source, device type and the like arrive as enumerated names.
-    var labels = null;
-    if (column.strings) labels = column.strings.values;
-    else if (column.timestamps) labels = column.timestamps.values;
-    else if (column.dateIds) labels = column.dateIds.values;
-    else if (column.enumValues) labels = column.enumValues.values;
-    return { type: column.dimension.type, labels: labels, timestamps: !!column.timestamps };
+    return { type: column.dimension.type, labels: columnLabels(column), timestamps: !!column.timestamps };
   }
 
   // "Your channel got 24 views in the last 7 days" quotes the figure the
@@ -562,25 +595,69 @@
       if (dimension.timestamps && dimension.labels.length) range = timestampRange(dimension.labels);
       if (!range) return;
 
-      var key = 'rv_table_' + index;
       var restricts = ctx.restricts.slice();
       var isEntityDimension = dimension.type === 'VIDEO' || dimension.type === 'PLAYLIST';
       if (isEntityDimension) restricts = restricts.concat([{ dimension: { type: dimension.type }, inValues: dimension.labels }]);
 
+      // Traffic source detail - a search term, a linking site - is only
+      // answered when the query says which kind of source it belongs to. The
+      // row names carry that as a prefix, so they are grouped by it and asked
+      // for a group at a time.
+      var groups = [{ restricts: restricts, rows: dimension.labels }];
+      if (dimension.type === 'TRAFFIC_SOURCE_DETAIL') {
+        var byPrefix = {};
+        dimension.labels.forEach(function (label) {
+          var prefix = String(label).split('.')[0];
+          (byPrefix[prefix] = byPrefix[prefix] || []).push(label);
+        });
+        groups = Object.keys(byPrefix).map(function (prefix) {
+          return {
+            restricts: restricts.concat([{ dimension: { type: 'TRAFFIC_SOURCE_TYPE' }, inValues: [prefix] }]),
+            rows: byPrefix[prefix]
+          };
+        });
+      }
+
+      var keys = groups.map(function (group, part) {
+        var key = 'rv_table_' + index + '_' + part;
+        nodes.push({
+          key: key,
+          value: {
+            query: buildQuery({
+              dimensions: [{ type: dimension.type }],
+              range: range,
+              restricts: group.restricts,
+              currency: ctx.currency,
+              limit: isEntityDimension || dimension.type === 'TRAFFIC_SOURCE_DETAIL' ? Math.max(group.rows.length, 25) : undefined
+            })
+          }
+        });
+        return key;
+      });
+
+      plans.push({ kind: 'table', entry: entry, labels: dimension.labels, keys: keys });
+    });
+
+    if (found.entities.length) {
+      // A card can carry these figures without the screen stating a period -
+      // the retention curve counts a video's whole life - so fall back to that.
+      var entityRange = ctx.range || { kind: 'days', inclusiveStart: 20050101, exclusiveEnd: toDateId(Date.now() + DAY_MS, 0) };
+      var ids = found.entities.map(function (entity) { return entity.videoId; });
+      var entityKey = 'rv_entities';
       nodes.push({
-        key: key,
+        key: entityKey,
         value: {
           query: buildQuery({
-            dimensions: [{ type: dimension.type }],
-            range: range,
-            restricts: restricts,
+            dimensions: [{ type: 'VIDEO' }],
+            range: entityRange,
+            restricts: ctx.restricts.concat([{ dimension: { type: 'VIDEO' }, inValues: ids }]),
             currency: ctx.currency,
-            limit: isEntityDimension ? dimension.labels.length : undefined
+            limit: ids.length
           })
         }
       });
-      plans.push({ kind: 'table', entry: entry, labels: dimension.labels, key: key });
-    });
+      plans.push({ kind: 'entities', entities: found.entities, key: entityKey });
+    }
 
     return { nodes: nodes, plans: plans, found: found, payload: payload };
   }
@@ -659,21 +736,30 @@
         return;
       }
       if (Array.isArray(node.metricColumns)) {
-        // A table split by two dimensions at once, or one with no rows, draws a
-        // sparkline rather than a captioned figure. Neither can be converted and
-        // neither carries a label, so neither stands in the way of correcting
-        // the wording elsewhere on the screen.
+        // A sparkline - a run of time buckets split by something else - draws a
+        // shape rather than captioned figures, and cannot be converted. Nor can
+        // a table with no rows. Neither carries a caption, so neither stands in
+        // the way of correcting the wording elsewhere on the screen.
+        //
+        // Any other table split two ways is a real table with real figures in
+        // it: it cannot be converted either, but it is captioned, so it does.
         var dimensions = node.dimensionColumns;
-        var drawnAsFigures = !dimensions || dimensions.length === 1;
-        var dimension = drawnAsFigures && dimensions ? tableDimension(node) : null;
-        var hasRows = !dimensions || (dimension && dimension.labels && dimension.labels.length);
+        var sparkline = dimensions && dimensions.length > 1 && dimensions.some(function (column) {
+          return !!(column.timestamps || column.dateIds);
+        });
+        var rows = dimensions && dimensions.length ? columnLabels(dimensions[0]) : null;
+        var hasRows = !dimensions || !dimensions.length || (rows && rows.length);
 
-        if (drawnAsFigures && hasRows) {
+        if (!sparkline && hasRows) {
           for (var c = 0; c < node.metricColumns.length; c++) {
             var column = node.metricColumns[c];
             if (!column || !column.metric || column.metric.type !== SOURCE_METRIC) continue;
             if (!column.counts && !column.percentages) continue;
-            if (converted.indexOf(column) === -1) { left = true; return; }
+            if (converted.indexOf(column) === -1) {
+              log('left raw:', (dimensions && dimensions[0] && dimensions[0].dimension && dimensions[0].dimension.type) || 'a table with no dimension', 'rows', rows ? rows.length : 0);
+              left = true;
+              return;
+            }
           }
         }
       }
@@ -782,13 +868,39 @@
         delete item.content.anomalies;
       }
 
+      if (item.kind === 'entities') {
+        var counts = results[item.key];
+        if (!counts || !counts.labels) return;
+        var byVideo = {};
+        for (var e = 0; e < counts.labels.length; e++) byVideo[counts.labels[e]] = Number(counts.values[e]);
+        item.entities.forEach(function (entity) {
+          if (!Object.prototype.hasOwnProperty.call(byVideo, entity.videoId)) return;
+          entity.totals.views = byVideo[entity.videoId];
+          converted.push(entity.totals);
+          changed = true;
+        });
+      }
+
       if (item.kind === 'table') {
         tablesFound++;
-        var result = results[item.key];
-        if (!result || !result.labels) return;
-        converted.push(item.entry.column);
+        // Every part of the table has to have been answered. A table half
+        // filled from figures and half left raw would be worse than either.
+        var answers = item.keys.map(function (key) { return results[key]; });
+        if (answers.some(function (answer) { return !answer; })) {
+          log('no answer for the', (tableDimension(item.entry.table) || {}).type || 'unnamed', 'table',
+            '| rows', item.labels.length, '| first', String(item.labels[0]).slice(0, 40));
+          return;
+        }
+
+        // An answer with no rows at all is not a failure: it means there were no
+        // engaged views in that window, so every row of the table is zero. A
+        // failed query is a different thing, and arrives as nothing at all.
         var byLabel = {};
-        for (var r = 0; r < result.labels.length; r++) byLabel[String(result.labels[r])] = Number(result.values[r]);
+        answers.forEach(function (answer) {
+          if (!answer.labels) return;
+          for (var r = 0; r < answer.labels.length; r++) byLabel[String(answer.labels[r])] = Number(answer.values[r]);
+        });
+        converted.push(item.entry.column);
         var replacement = item.labels.map(function (label) {
           var name = String(label);
           return Object.prototype.hasOwnProperty.call(byLabel, name) ? byLabel[name] : 0;
@@ -821,7 +933,10 @@
     // here, so a screen carrying one is not relabelled either - otherwise its
     // raw count would be captioned as an engaged one.
     var leftRaw = anyRawFiguresLeft(plan.payload, converted) || cardsLeftRaw(plan.payload, converted);
-    if (tablesFound > 0 && tablesFound === tablesConverted && !leftRaw) markConverted('analytics');
+    var vouch = tablesFound > 0 && tablesFound === tablesConverted && !leftRaw;
+    log('wording:', vouch ? 'safe to correct' : 'left as Studio wrote it',
+      '| tables', tablesConverted + '/' + tablesFound, '| anything raw:', leftRaw);
+    if (vouch) markConverted('analytics');
     else if (tablesFound > 0 || leftRaw) markUnconverted('analytics');
 
     return changed;

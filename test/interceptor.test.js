@@ -376,7 +376,7 @@ test('a query that never answers cannot hold the screen open', async () => {
   const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
   const waited = Date.now() - started;
 
-  assert.ok(waited < 9000, 'delivered without waiting forever, took ' + waited + 'ms');
+  assert.ok(waited < 9000, 'delivered within the query budget, took ' + waited + 'ms');
   const content = JSON.parse(result.text).cards[1].keyMetricCardData.keyMetricTabs[0].primaryContent;
   assert.strictEqual(content.metric, 'EXTERNAL_VIEWS', 'untouched rather than relabelled');
   assert.strictEqual(content.total, 28, 'the original figure survives');
@@ -890,6 +890,103 @@ test('a share-only table is converted from figures fetched for it', async () => 
   const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
   const column = JSON.parse(result.text).cards[0].tableCardData.mainTableData.metricColumns[0];
   assert.deepStrictEqual(column.percentages.values, [30, 70], 'the shares describe the engaged figures now');
+});
+
+test('a real table split two ways still blocks the wording', async () => {
+  // Not a sparkline: no time axis, so these are captioned figures on screen.
+  // They cannot be converted, so the wording must stay as Studio wrote it.
+  const payload = JSON.parse(screenResponse());
+  payload.cards.push({
+    tableCardData: {
+      mainTableData: {
+        dimensionColumns: [
+          { dimension: { type: 'TRAFFIC_SOURCE_TYPE' }, enumValues: { values: ['YT_SEARCH'] } },
+          { dimension: { type: 'TRAFFIC_SOURCE_DETAIL' }, strings: { values: ['YT_SEARCH.thing'] } }
+        ],
+        metricColumns: [{ metric: { type: 'EXTERNAL_VIEWS' }, counts: { values: [130400] } }]
+      }
+    }
+  });
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'yta_web/join': joinResponder({ vidA: 11, vidB: 4 })
+  });
+  await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  assert.strictEqual(env.attributes['data-realview-converted-analytics'], 'no');
+});
+
+test('detail rows are asked for one source type at a time', async () => {
+  // The server refuses a traffic detail query that does not say which kind of
+  // source it means. The row names carry that as a prefix.
+  const payload = { cards: [{ tableCardData: { mainTableData: {
+    dimensionColumns: [{ dimension: { type: 'TRAFFIC_SOURCE_DETAIL' }, strings: { values: ['YT_SEARCH.one', 'YT_SEARCH.two', 'EXT_URL.site'] } }],
+    metricColumns: [{ metric: { type: 'EXTERNAL_VIEWS' }, counts: { values: [10, 20, 30] } }]
+  } } }] };
+
+  const asked = [];
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'yta_web/join': (body) => {
+      const nodes = JSON.parse(body).nodes;
+      return {
+        status: 200,
+        text: JSON.stringify({
+          results: nodes.map((node) => {
+            const restrict = node.value.query.restricts.find((r) => r.dimension.type === 'TRAFFIC_SOURCE_TYPE');
+            if (restrict) asked.push(restrict.inValues[0]);
+            const rows = restrict && restrict.inValues[0] === 'YT_SEARCH'
+              ? { labels: ['YT_SEARCH.one', 'YT_SEARCH.two'], values: [1, 2] }
+              : { labels: ['EXT_URL.site'], values: [3] };
+            return { key: node.key, value: { resultTable: {
+              dimensionColumns: [{ dimension: { type: 'TRAFFIC_SOURCE_DETAIL' }, strings: { values: rows.labels } }],
+              metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: rows.values } }]
+            } } };
+          })
+        })
+      };
+    }
+  });
+
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  assert.deepStrictEqual(asked.sort(), ['EXT_URL', 'YT_SEARCH'], 'one query per kind of source');
+  const column = JSON.parse(result.text).cards[0].tableCardData.mainTableData.metricColumns[0];
+  assert.deepStrictEqual(column.counts.values, [1, 2, 3], 'and the rows are stitched back together in order');
+});
+
+test('a table whose answer has no rows becomes zeros, not a failure', async () => {
+  const payload = { cards: [{ tableCardData: { mainTableData: {
+    dimensionColumns: [{ dimension: { type: 'TRAFFIC_SOURCE_TYPE' }, enumValues: { values: ['YT_SEARCH'] } }],
+    metricColumns: [{ metric: { type: 'EXTERNAL_VIEWS' }, counts: { values: [14] } }]
+  } } }] };
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'yta_web/join': (body) => ({
+      status: 200,
+      text: JSON.stringify({ results: JSON.parse(body).nodes.map((n) => ({ key: n.key, value: { resultTable: { metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: [] } }] } } })) })
+    })
+  });
+
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const column = JSON.parse(result.text).cards[0].tableCardData.mainTableData.metricColumns[0];
+  assert.deepStrictEqual(column.counts.values, [0], 'no engaged views in that window means zero, not raw');
+  assert.strictEqual(env.attributes['data-realview-converted-analytics'], 'yes');
+});
+
+test("a card's own view count for a video is converted too", async () => {
+  const payload = JSON.parse(screenResponse());
+  payload.cards.push({ audienceRetentionHighlightsCardData: { videosData: [{ videoId: 'vidA', metricTotals: { avgPercentageWatched: 0.55, views: 3693 } }] } });
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'yta_web/join': joinResponder({ vidA: 11, vidB: 4 })
+  });
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const totals = JSON.parse(result.text).cards[3].audienceRetentionHighlightsCardData.videosData[0].metricTotals;
+
+  assert.strictEqual(totals.views, 11, 'the count follows the metric');
+  assert.strictEqual(totals.avgPercentageWatched, 0.55, 'and nothing else on the card is touched');
+  assert.strictEqual(env.attributes['data-realview-converted-analytics'], 'yes');
 });
 
 test('an unrelated request is not touched', async () => {
