@@ -1,5 +1,5 @@
 # RealView
-
+(pending Google Extension Store Review)
 A Chrome extension that makes YouTube Studio show **engaged views** — the older definition of a
 view, counted after roughly 30 seconds of watching — everywhere it normally shows the newer Views
 figure. It also colours the analytics graphs red.
