@@ -301,3 +301,8 @@ suite covers each conversion technique, the parallel query, the cache, the four-
 a failing query, an error from Studio, the disabled state, the exact event sequence a rewritten
 response is delivered with, an exception inside the extension, and the fault limit standing the
 extension down.
+
+## License
+
+[GPL-3.0](LICENSE). Use it freely; if you distribute a modified version, its source must be
+published under the same license.
