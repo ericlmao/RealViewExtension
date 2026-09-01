@@ -97,6 +97,14 @@ On the channel this was built against the difference is real: over 365 days the 
   Videos that tie share a place, as Studio does it. If any video in the list cannot be dated, the
   ranking is left exactly as the server sent it rather than half rebuilt.
 
+  The card beside the ranking also carries the server's judgement of the same figures: a typical
+  band and an arrow saying whether this video sits above it, inside it or below it. Both were made
+  from raw views, so once the ranking is engaged they are redone from the same engaged figures —
+  the band becomes the middle half of the list, and the arrow follows from where the video's own
+  figure lands in it. If the verdict changes, the sentence the server wrote for the old one
+  ("Looking good! This video is performing as usual") is dropped rather than left to contradict
+  the arrow. A row the server did not judge is left unjudged.
+
 Any card that mentions views and had nothing converted inside it is taken at its word, and the
 wording on that screen is left as Studio wrote it.
 
@@ -187,6 +195,15 @@ intact — and replaces the views part with a band worked out from the channel's
 history: the same number of days over each of the preceding eight periods, reduced to a middle
 value and a quartile range. Fewer than four periods with data and the comparison is dropped
 rather than guessed at.
+
+### A column the swapped query already answered
+
+The dashboard's own queries have their metric swapped on the way out, so their answers arrive
+already engaged — over whatever window the server chose for each of them. The top-content list is
+one: the server picks its videos and counts them over the last 48 hours. Those columns must not
+be converted again on the way in, because the second pass would use the request's own 28-day
+window and overwrite the right figures with wrong ones. A column that came back already engaged
+is recognised and left exactly as answered.
 
 ### A screen that names no period
 

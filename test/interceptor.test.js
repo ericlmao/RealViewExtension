@@ -1155,6 +1155,100 @@ test('a ranking is left alone when a video cannot be dated', async () => {
   assert.deepStrictEqual(entities.map((e) => e.rank), [1, 2], 'order untouched');
 });
 
+test("the card's own comparison is redone from the rebuilt ranking", async () => {
+  // The row beside the ranking says whether the video is doing better or worse
+  // than usual, judged by the server on raw views. Once the ranking is engaged,
+  // the band and the arrow have to be too: raw said "up", engaged says typical.
+  const now = Date.now();
+  const ranking = { entities: [
+    { rank: 1, entity: { videoId: 'vidA' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 900 } },
+    { rank: 2, entity: { videoId: 'vidB' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 500 } },
+    { rank: 3, entity: { videoId: 'vidC' }, metric: { type: 'EXTERNAL_VIEWS' }, value: { double: 100 } }
+  ] };
+  const payload = { cards: [{ entitySnapshotCardData: {
+    video: { externalVideoId: 'vidA' },
+    ranking,
+    headline: { text: 'Looking good! This video is performing better than usual.' },
+    metricsTable: { metricRows: [
+      {
+        metric: { type: 'EXTERNAL_VIEWS' },
+        value: { double: 900 },
+        trend: 'TREND_TYPE_UP',
+        typicalRange: { typicalRange: { lowerBound: 800, upperBound: 2000 } },
+        performanceAnalysis: 'Better than usual'
+      },
+      {
+        metric: { type: 'VIDEO_THUMBNAIL_IMPRESSIONS_VTR' },
+        value: { double: 5 },
+        trend: 'TREND_TYPE_UP',
+        typicalRange: { typicalRange: { lowerBound: 1, upperBound: 9 } }
+      }
+    ] }
+  } }] };
+
+  const engaged = { vidA: 20, vidB: 5, vidC: 60 };
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'list_creator_videos': () => ({ status: 200, text: JSON.stringify({ videos: ['vidA', 'vidB', 'vidC'].map((id, i) => ({ videoId: id, timePublishedSeconds: String(Math.floor((now - (3 + i * 30) * 3600000) / 1000)) })) }) }),
+    'yta_web/join': (body) => ({
+      status: 200,
+      text: JSON.stringify({ results: JSON.parse(body).nodes.map((node) => {
+        const wanted = (node.value.query.restricts.find((r) => r.dimension.type === 'VIDEO') || { inValues: [] }).inValues;
+        return { key: node.key, value: { resultTable: {
+          dimensionColumns: [{ dimension: { type: 'VIDEO' }, strings: { values: wanted } }],
+          metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: wanted.map((id) => engaged[id] || 0) } }]
+        } } };
+      }) })
+    })
+  });
+
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const card = JSON.parse(result.text).cards[0].entitySnapshotCardData;
+  const rows = card.metricsTable.metricRows;
+
+  // Engaged figures 5, 20, 60: the middle half runs 13 to 40, and vidA's 20
+  // sits inside it.
+  assert.deepStrictEqual(rows[0].typicalRange.typicalRange, { lowerBound: 13, upperBound: 40 }, 'the band is the middle half of the engaged figures');
+  assert.strictEqual(rows[0].trend, 'TREND_TYPE_TYPICAL', 'the arrow now matches the engaged figure');
+  assert.strictEqual(rows[0].value.double, 20, 'the figure itself is engaged');
+  assert.strictEqual(card.headline, undefined, 'the old verdict sentence is dropped rather than left to lie');
+  assert.strictEqual(rows[0].performanceAnalysis, undefined, 'and so is its tooltip');
+  assert.strictEqual(rows[1].trend, 'TREND_TYPE_UP', 'a row for another metric keeps its own judgement');
+  assert.deepStrictEqual(rows[1].typicalRange.typicalRange, { lowerBound: 1, upperBound: 9 }, 'and its own band');
+});
+
+test("a dashboard column the swapped query already answered is not asked again", async () => {
+  // The top-content list is answered by the dashboard's own query over the
+  // server's window for it - the last 48 hours - with the metric swapped on
+  // the way out. Converting it again would swap that window for the request's
+  // 28-day one and overwrite the right figures.
+  const env = createEnvironment({
+    'get_channel_dashboard': () => ({ status: 200, text: JSON.stringify({ cards: [{ body: { basicCard: { item: { channelFactsItem: { channelFactsData: { results: [
+      { key: 'TOP_VIDEOS', value: { resultTable: {
+        dimensionColumns: [{ dimension: { type: 'VIDEO' }, strings: { values: ['vidA', 'vidB', 'vidC'] } }],
+        metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: [6, 4, 2] } }]
+      } } }
+    ] } } } } } }] }) }),
+    'yta_web/join': joinResponder({ vidA: 46, vidB: 0, vidC: 0 })
+  });
+  const body = JSON.stringify({
+    context: {},
+    dashboardParams: {
+      channelId: CHANNEL,
+      nodes: [{ key: 'current', value: { query: { metrics: [{ type: 'EXTERNAL_VIEWS' }], timeRange: { dateIdRange: { inclusiveStart: 20260803, exclusiveEnd: 20260831 } } } } }]
+    }
+  });
+
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/creator/get_channel_dashboard?alt=json', body);
+  const table = JSON.parse(result.text).cards[0].body.basicCard.item.channelFactsItem.channelFactsData.results[0].value.resultTable;
+
+  assert.strictEqual(table.metricColumns[0].metric.type, 'EXTERNAL_VIEWS', 'renamed back for the caller');
+  assert.deepStrictEqual(table.metricColumns[0].counts.values, [6, 4, 2], 'still the figures the swapped query was answered with');
+
+  const videoJoins = env.sent.filter((entry) => entry.url.includes('join') && entry.body.includes('"VIDEO"'));
+  assert.strictEqual(videoJoins.length, 0, 'no per-video query was sent to redo it');
+});
+
 test('a table split by two dimensions is matched on the pair', async () => {
   // Age against gender: each row is identified by both names, so the answer has
   // to be lined up on the pair rather than on either half.

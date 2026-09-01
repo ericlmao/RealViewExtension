@@ -432,7 +432,10 @@
             item.metric && item.metric.type === SOURCE_METRIC &&
             item.value && typeof item.value.double === 'number';
         });
-        if (ranked.length === node.ranking.entities.length) rankings.push(node.ranking);
+        // The card around the ranking compares its video against the same
+        // videos, so it is kept alongside for its comparison to be redone
+        // from the same figures.
+        if (ranked.length === node.ranking.entities.length) rankings.push({ ranking: node.ranking, holder: node });
       }
 
       // The latest-video card reports each of its metrics as a row of its own,
@@ -714,6 +717,12 @@
     });
 
     found.tables.forEach(function (entry, index) {
+      // A dashboard column was answered by a query whose metric was swapped on
+      // the way out, so it already holds engaged figures over the window the
+      // server chose for it. Asking again would swap that window for the
+      // screen's own and overwrite the right figures with wrong ones.
+      if (ctx.preConverted && ctx.preConverted.indexOf(entry.column) !== -1) return;
+
       var scoped = contentTypeRestricts(ctx, entry);
       if (!scoped) { log('left raw: a', entry.contentType, 'table, which cannot be asked for'); return; }
 
@@ -1215,8 +1224,8 @@
     var plan = planConversion(payload, ctx);
     if (plan.nodes.length === 0 && plan.found.rankings.length === 0) return Promise.resolve(false);
 
-    var rankings = Promise.all(plan.found.rankings.map(function (ranking) {
-      return convertRanking(ranking, ctx);
+    var rankings = Promise.all(plan.found.rankings.map(function (entry) {
+      return convertRanking(entry.ranking, entry.holder, ctx);
     }));
 
     return Promise.all([runQueries(ctx, plan.nodes), rankings]).then(function (both) {
@@ -1286,7 +1295,46 @@
     return above + 1;
   }
 
-  function convertRanking(ranking, ctx) {
+  // The row beside the ranking carries the server's judgement of the same
+  // figures: a band of what is typical for these videos and an arrow saying
+  // where this one sits in it. Both were made from raw views, so both are
+  // redone from the engaged figures the ranking was just rebuilt with. A row
+  // the server did not judge is left unjudged rather than given a verdict.
+  function applySnapshotComparison(holder, ids, figures) {
+    if (!holder || !holder.metricsTable || !Array.isArray(holder.metricsTable.metricRows)) return;
+    var primary = holder.video && holder.video.externalVideoId;
+    var at = ids.indexOf(primary);
+    if (at === -1) return;
+    var mine = figures[at];
+
+    var sorted = figures.slice().sort(function (a, b) { return a - b; });
+    function percentile(fraction) {
+      var position = (sorted.length - 1) * fraction;
+      var low = Math.floor(position);
+      var high = Math.ceil(position);
+      return sorted[low] + (sorted[high] - sorted[low]) * (position - low);
+    }
+    var lower = Math.round(percentile(0.25));
+    var upper = Math.round(percentile(0.75));
+
+    holder.metricsTable.metricRows.forEach(function (row) {
+      if (!row.metric || row.metric.type !== SOURCE_METRIC) return;
+      if (row.typicalRange && row.typicalRange.typicalRange) {
+        row.typicalRange.typicalRange = { lowerBound: lower, upperBound: upper };
+      }
+      if (typeof row.trend === 'string') {
+        var trend = mine > upper ? 'TREND_TYPE_UP' : mine < lower ? 'TREND_TYPE_DOWN' : 'TREND_TYPE_TYPICAL';
+        if (trend !== row.trend) {
+          row.trend = trend;
+          // The sentence above the rows was written for the old verdict.
+          delete holder.headline;
+          delete row.performanceAnalysis;
+        }
+      }
+    });
+  }
+
+  function convertRanking(ranking, holder, ctx) {
     var ids = ranking.entities.map(function (item) { return item.entity.videoId; });
 
     return fetchPublishTimes(ctx, ids).then(function (times) {
@@ -1337,6 +1385,7 @@
         ranking.entities.forEach(function (item, index) { item.value.double = figures[index]; });
         ranking.entities.sort(function (a, b) { return b.value.double - a.value.double; });
         ranking.entities.forEach(function (item) { item.rank = placeOf(item.value.double, figures); });
+        applySnapshotComparison(holder, ids, figures);
 
         log('ranking rebuilt from engaged views', figures);
         return true;
