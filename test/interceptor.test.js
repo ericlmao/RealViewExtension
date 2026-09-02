@@ -835,6 +835,46 @@ test('several points inside one bucket are not each credited with it', async () 
   assert.strictEqual(ys[ys.length - 1], content.total, 'ending exactly on the figure shown');
 });
 
+test('points finer than the hourly buckets climb steadily rather than once an hour', async () => {
+  // A new video's chart marks every few minutes, while the engaged figures
+  // only come by the hour. Crediting each hour whole at its start drew a
+  // staircase: flat for an hour, then a jump. Each hour is spread across its
+  // minutes instead.
+  const start = dayStart(-1);
+  const datums = [];
+  for (let i = 0; i <= 12; i++) datums.push({ x: start + i * 10 * 60000, y: 0 });
+
+  const payload = { cards: [{ keyMetricCardData: { keyMetricTabs: [{
+    metricTabConfig: { metric: 'EXTERNAL_VIEWS' },
+    primaryContent: { metric: 'EXTERNAL_VIEWS', total: 9000, mainSeries: { datums, isCumulative: true } }
+  }] } }] };
+
+  const env = createEnvironment({
+    'get_screen': JSON.stringify(payload),
+    'yta_web/join': (body) => ({
+      status: 200,
+      text: JSON.stringify({
+        results: JSON.parse(body).nodes.map((node) => {
+          const dimension = (node.value.query.dimensions[0] || {}).type;
+          if (dimension !== 'HOUR') return { key: node.key, value: { resultTable: { metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values: [999999] } }] } } };
+          // Two hourly buckets: 600 in the first hour, 300 in the second.
+          const labels = [start, start + 3600000];
+          const values = [600, 300];
+          return { key: node.key, value: { resultTable: { dimensionColumns: [{ dimension: { type: 'HOUR' }, timestamps: { values: labels } }], metricColumns: [{ metric: { type: 'ENGAGED_VIEWS' }, counts: { values } }] } } };
+        })
+      })
+    })
+  });
+
+  const result = await request(env, 'https://studio.youtube.com/youtubei/v1/yta_web/get_screen?alt=json', screenRequest());
+  const content = JSON.parse(result.text).cards[0].keyMetricCardData.keyMetricTabs[0].primaryContent;
+
+  assert.strictEqual(content.total, 900);
+  const ys = content.mainSeries.datums.map((d) => Math.round(d.y));
+  assert.deepStrictEqual(ys, [0, 100, 200, 300, 400, 500, 600, 650, 700, 750, 800, 850, 900], 'every ten minutes adds its share of the hour');
+  for (let i = 1; i < ys.length; i++) assert.ok(ys[i] >= ys[i - 1], 'and the line never falls');
+});
+
 test('a card reporting figures in an unfamiliar shape withdraws the relabelling', async () => {
   // Nothing here is a metric column, so the substitution had no way in. Saying
   // nothing would leave the card's raw count captioned as an engaged one.

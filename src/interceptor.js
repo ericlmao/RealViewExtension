@@ -984,16 +984,16 @@
   function collectBuckets(item, results, ctx) {
     var buckets = [];
 
-    function add(table, toMs) {
+    function add(table, spanMs, toMs) {
       if (!table || !table.labels) return;
       for (var i = 0; i < table.labels.length; i++) {
-        buckets.push({ startMs: toMs(table.labels[i]), value: Number(table.values[i]) });
+        buckets.push({ startMs: toMs(table.labels[i]), spanMs: spanMs, value: Number(table.values[i]) });
       }
     }
 
-    add(results[item.keys.days], function (label) { return dateIdToMs(Number(label)) - ctx.offsetSecs * 1000; });
-    add(results[item.keys.hours], function (label) { return Number(label); });
-    if (!item.cumulative) add(results[item.keys.series], function (label) { return dateIdToMs(Number(label)) - ctx.offsetSecs * 1000; });
+    add(results[item.keys.days], DAY_MS, function (label) { return dateIdToMs(Number(label)) - ctx.offsetSecs * 1000; });
+    add(results[item.keys.hours], HOUR_MS, function (label) { return Number(label); });
+    if (!item.cumulative) add(results[item.keys.series], DAY_MS, function (label) { return dateIdToMs(Number(label)) - ctx.offsetSecs * 1000; });
 
     buckets.sort(function (a, b) { return a.startMs - b.startMs; });
     return buckets;
@@ -1002,19 +1002,52 @@
   // Each point on the line is worth everything that had accrued by the moment
   // it marks, so several points inside one bucket share that bucket's figure
   // rather than each being credited with it.
+  //
+  // A point that lands on a bucket's start is credited with the whole bucket
+  // when the points are no finer than the buckets, which is how Studio draws
+  // a daily line: the point for a day carries that day's figure. When the
+  // points are finer - a new video's chart marks every few minutes, while the
+  // engaged figures only come by the hour - crediting the whole bucket at once
+  // would draw a staircase that climbs once an hour and lies flat in between.
+  // Each bucket is spread evenly across its span instead, so a point twenty
+  // minutes into an hour is worth a third of that hour.
   function fillSeries(datums, buckets, cumulative) {
     var index = 0;
     var running = 0;
+    var spread = cumulative && pointsFinerThanBuckets(datums, buckets);
+    var now = Date.now();
     for (var d = 0; d < datums.length; d++) {
       var upTo = datums[d].x;
       var latest = 0;
-      while (index < buckets.length && buckets[index].startMs <= upTo) {
+      while (index < buckets.length && bucketCountedBy(buckets[index], upTo, spread)) {
         running += buckets[index].value;
         latest = buckets[index].value;
         index++;
       }
-      datums[d].y = cumulative ? running : latest;
+      var partial = 0;
+      if (spread && index < buckets.length && buckets[index].startMs < upTo) {
+        var bucket = buckets[index];
+        // A bucket still being filled has only run up to this moment, so what
+        // it holds so far is spread over the part of it that has passed.
+        var end = Math.min(bucket.startMs + bucket.spanMs, Math.max(now, bucket.startMs + 1));
+        var fraction = (upTo - bucket.startMs) / (end - bucket.startMs);
+        partial = bucket.value * Math.min(1, Math.max(0, fraction));
+      }
+      datums[d].y = cumulative ? running + partial : latest;
     }
+  }
+
+  function bucketCountedBy(bucket, upTo, spread) {
+    return spread ? bucket.startMs + bucket.spanMs <= upTo : bucket.startMs <= upTo;
+  }
+
+  function pointsFinerThanBuckets(datums, buckets) {
+    if (datums.length < 2 || !buckets.length) return false;
+    var step = Infinity;
+    for (var d = 1; d < datums.length; d++) step = Math.min(step, datums[d].x - datums[d - 1].x);
+    var span = Infinity;
+    for (var b = 0; b < buckets.length; b++) span = Math.min(span, buckets[b].spanMs);
+    return step < span;
   }
 
   function applyConversion(plan, results, ctx) {
